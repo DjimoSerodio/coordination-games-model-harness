@@ -490,6 +490,65 @@ function normalizeDecision(raw: unknown): ModelDecision {
   };
 }
 
+function visibleSetupIntersectionId(visibleState: unknown): string | null {
+  if (!isRecord(visibleState) || visibleState.phase !== 'waiting') return null;
+  const intersections = Array.isArray(visibleState.intersections)
+    ? visibleState.intersections.filter(isRecord)
+    : [];
+  const structures = Array.isArray(visibleState.structures) ? visibleState.structures.filter(isRecord) : [];
+  const occupied = new Set(
+    structures
+      .map((structure) => (typeof structure.intersectionId === 'string' ? structure.intersectionId : ''))
+      .filter(Boolean),
+  );
+  const hexKeys = (intersection: Record<string, unknown>): Set<string> => {
+    const hexes = Array.isArray(intersection.hexes) ? intersection.hexes.filter(isRecord) : [];
+    return new Set(
+      hexes
+        .map((hex) => (typeof hex.q === 'number' && typeof hex.r === 'number' ? `${hex.q},${hex.r}` : ''))
+        .filter(Boolean),
+    );
+  };
+  const intersectionsById = new Map(
+    intersections.flatMap((intersection) =>
+      typeof intersection.id === 'string' ? ([[intersection.id, intersection]] as const) : [],
+    ),
+  );
+  const isAdjacentToOccupied = (intersection: Record<string, unknown>): boolean => {
+    const currentHexes = hexKeys(intersection);
+    for (const occupiedId of occupied) {
+      const occupiedIntersection = intersectionsById.get(occupiedId);
+      if (!occupiedIntersection) continue;
+      const shared = [...hexKeys(occupiedIntersection)].filter((key) => currentHexes.has(key));
+      if (shared.length >= 2) return true;
+    }
+    return false;
+  };
+  const legalIntersection = intersections.find(
+    (intersection) =>
+      typeof intersection.id === 'string' &&
+      !occupied.has(intersection.id) &&
+      intersection.occupantStructureId === undefined &&
+      !isAdjacentToOccupied(intersection),
+  );
+  return typeof legalIntersection?.id === 'string' ? legalIntersection.id : null;
+}
+
+function normalizeSetupAction(decision: ModelDecision, visibleState: unknown): ModelDecision {
+  const intersectionId = visibleSetupIntersectionId(visibleState);
+  if (!intersectionId) return decision;
+  const currentAction = decision.action;
+  const currentIntersectionId = isRecord(currentAction) ? currentAction.intersectionId : undefined;
+  if (currentAction.type === 'place_starting_camp' && typeof currentIntersectionId === 'string') {
+    return decision;
+  }
+  return {
+    ...decision,
+    reasoning: `${decision.reasoning}\n\n[harness setup guardrail] Provider returned an invalid setup action; using legal place_starting_camp to keep the live game moving.`,
+    action: { type: 'place_starting_camp', intersectionId },
+  };
+}
+
 class ScriptedProvider implements ModelProvider {
   readonly name = 'scripted';
 
@@ -501,6 +560,16 @@ class ScriptedProvider implements ModelProvider {
         privateMessage: input.bot.persona.privateStyle,
         dmRecipient: input.wakeContext?.privateReplyTo,
         action: { type: 'pass' },
+      };
+    }
+    if (isRecord(input.visibleState) && input.visibleState.phase === 'waiting') {
+      const intersectionId = visibleSetupIntersectionId(input.visibleState) ?? 'northWest';
+      return {
+        reasoning: `${input.bot.name}: ${input.bot.persona.title}; scripted setup placement using first visible legal-looking empty intersection.`,
+        publicMessage: input.bot.persona.publicStyle,
+        privateMessage: input.bot.persona.privateStyle,
+        dmRecipient: undefined,
+        action: { type: 'place_starting_camp', intersectionId },
       };
     }
     return {
@@ -574,6 +643,7 @@ Return ONLY compact JSON with this exact shape:
 
 Valid actions with exact schemas:
 - pass: {"type":"pass"}
+- place_starting_camp: {"type":"place_starting_camp","intersectionId":"<id>"}
 - extract_commons: {"type":"extract_commons","ecosystemId":"<id>","level":"low|medium|high"}
 - build_settlement: {"type":"build_settlement","regionId":"<id>"}
 - offer_trade: {"type":"offer_trade","to":"<playerId>","give":{"grain":0,"timber":0,"ore":0,"fish":0,"water":0,"energy":0},"receive":{"grain":0,"timber":0,"ore":0,"fish":0,"water":0,"energy":0}}
@@ -1033,7 +1103,7 @@ async function main(): Promise<void> {
       nextRelayCursorByBot.set(activeBot.playerId, context.nextRelayCursor);
       console.log(`  ${activeBot.name}: relayFeed=${turnFeedRelays.length} totalVisibleRelay=${context.relayMessages.length}`);
       const turnWakeContext = buildWakeContext(activeBot, bots, turnFeedRelays);
-      const decision = await decideWithRetries(
+      let decision = await decideWithRetries(
         provider,
         {
           bot: activeBot,
@@ -1050,6 +1120,7 @@ async function main(): Promise<void> {
         },
         { type: 'turn', relayCursor: `${previousCursor}->${context.nextRelayCursor}` },
       );
+      decision = normalizeSetupAction(decision, visibleState);
       await publishDecisionMessages(activeBot, bots, decision, provider, turnWakeContext.privateReplyTo);
 
       const { type, ...args } = decision.action;
