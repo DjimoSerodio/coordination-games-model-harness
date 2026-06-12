@@ -2,7 +2,9 @@
 
 Standalone local E2E harness for running scripted or OpenAI-compatible model agents against a local Coordination Games server.
 
-The harness creates ephemeral wallet-backed bots, starts a lobby, joins the bots, polls player state, asks a provider for chat/DM/action decisions, publishes reasoning and chat relay messages, submits legal actions, and prints final spectator/inspector links plus message counts.
+The harness creates ephemeral wallet-backed bots, starts a lobby, joins the bots, polls player state, asks a provider for chat/DM/action decisions, publishes reasoning and chat relay messages, submits legal actions, and writes run artifacts plus final spectator/inspector links and message counts.
+
+This repository is the internal lab bench for hardening Coordination Games and running repeatable model/persona/trust-plugin experiments. It should not become the mandatory future interface for outside teams or bring-your-own-agent participants.
 
 ## Requirements
 
@@ -43,8 +45,33 @@ GAME_SERVER=http://127.0.0.1:8787 \
 BOT_CONFIG=examples/tragedy-bots.example.json \
 HARNESS_ROUNDS=12 \
 HARNESS_COMMUNICATION_SWEEPS=1 \
+HARNESS_RESULTS_DIR=runs/model-harness \
 npm run harness:model
 ```
+
+## Run artifacts and research controls
+
+Each run writes non-secret artifacts under `runs/model-harness/<run-id>/` unless `HARNESS_ARTIFACTS=0` is set:
+
+- `run.config.json` - resolved non-secret run configuration.
+- `games.jsonl` - lobby/game lifecycle events.
+- `turns.jsonl` - model decisions, submitted actions, and fallback outcomes.
+- `errors.jsonl` - provider/action errors with redacted sensitive text.
+- `summary.json` - final run summary and spectator/inspector URLs.
+- `costs.json` - observed token usage plus optional estimated USD cost.
+
+Useful knobs:
+
+```bash
+HARNESS_RUN_ID=my-local-run          # optional; sanitized before use
+HARNESS_MODEL_TIMEOUT_MS=90000      # per model call
+HARNESS_MODEL_RETRIES=1             # retry provider failures/timeouts
+HARNESS_MAX_COST_USD=5              # optional hard stop when rates are set
+HARNESS_PROMPT_USD_PER_1M=0.15      # optional estimate only
+HARNESS_COMPLETION_USD_PER_1M=0.60  # optional estimate only
+```
+
+Artifacts intentionally exclude provider API keys, inspector tokens, bot bearer tokens, and wallet private keys.
 
 ## Bot configuration
 
@@ -75,8 +102,10 @@ See `.env.example` for the full set of options. Important defaults:
 - `INSPECTOR_TOKEN=local-inspector-token`
 - `PROVIDER=scripted`
 
+No secrets belong in this repo. Export keys in your shell or use an ignored local env loader.
+
 ## Current scope
 
 This repository is intentionally still Tragedy-of-the-Commons-specific: the prompts and valid action schemas are tuned for `tragedy-of-the-commons`. The platform boundary is decoupled from the Coordination Games monorepo, but the target server must still implement the Coordination Games HTTP API.
 
-No secrets belong in this repo. Export keys in your shell or use an ignored local env loader.
+Because this is the lab bench, prefer adding reproducibility and analysis features here before changing game-server rules or future participant APIs.
