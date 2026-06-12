@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { Wallet } from 'ethers';
 import { api, asRecord, authenticate } from './api.js';
 
@@ -16,7 +17,15 @@ const WEB_BASE_URL = process.env.WEB_BASE_URL ?? 'http://127.0.0.1:5173';
 const INSPECTOR_TOKEN = process.env.INSPECTOR_TOKEN ?? 'local-inspector-token';
 const BOT_CONFIG_PATH = process.env.BOT_CONFIG;
 const APPEND_ADDRESS_SUFFIX = process.env.APPEND_ADDRESS_SUFFIX !== 'false';
-const RUN_ID = randomUUID();
+const RUN_ID = sanitizeRunId(process.env.HARNESS_RUN_ID ?? randomUUID());
+const MODEL_CALL_TIMEOUT_MS = Number.parseInt(process.env.HARNESS_MODEL_TIMEOUT_MS ?? '90000', 10);
+const MODEL_CALL_RETRIES = Number.parseInt(process.env.HARNESS_MODEL_RETRIES ?? '1', 10);
+const ARTIFACTS_ENABLED = process.env.HARNESS_ARTIFACTS !== '0';
+const ARTIFACT_ROOT = process.env.HARNESS_RESULTS_DIR ?? 'runs/model-harness';
+const RUN_DIR = path.join(ARTIFACT_ROOT, RUN_ID);
+const MAX_COST_USD = Number.parseFloat(process.env.HARNESS_MAX_COST_USD ?? '0');
+const PROMPT_USD_PER_1M = Number.parseFloat(process.env.HARNESS_PROMPT_USD_PER_1M ?? '0');
+const COMPLETION_USD_PER_1M = Number.parseFloat(process.env.HARNESS_COMPLETION_USD_PER_1M ?? '0');
 
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
   console.log(`Usage: npm run harness:model -- [--help]
@@ -30,6 +39,14 @@ Environment:
   TEAM_SIZE         Lobby team size (default 2)
   HARNESS_ROUNDS    Max game decision cycles before stopping (default 24)
   HARNESS_COMMUNICATION_SWEEPS  Chat/DM wake sweeps after each action (default 1)
+  HARNESS_RUN_ID    Optional artifact run id; sanitized before use
+  HARNESS_MODEL_TIMEOUT_MS      Per-model-call timeout (default 90000)
+  HARNESS_MODEL_RETRIES         Retries after timeout/provider errors (default 1)
+  HARNESS_ARTIFACTS             0 disables run artifact files (default enabled)
+  HARNESS_RESULTS_DIR           Artifact root directory (default runs/model-harness)
+  HARNESS_MAX_COST_USD          Optional hard stop when estimated cost exceeds this value
+  HARNESS_PROMPT_USD_PER_1M     Optional prompt-token rate for cost estimates
+  HARNESS_COMPLETION_USD_PER_1M Optional completion-token rate for cost estimates
   PROVIDER          scripted | openai-compatible | minimax (default scripted)
   OPENAI_BASE_URL   OpenAI-compatible base URL (MiniMax: https://api.minimax.io/v1)
   OPENAI_API_KEY    API key for openai-compatible/minimax
@@ -97,9 +114,44 @@ interface ProviderInput {
   wakeContext: WakeContext | undefined;
 }
 
+interface ProviderUsage {
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: number;
+}
+
 interface ModelProvider {
   readonly name: string;
   decide(input: ProviderInput): Promise<ModelDecision>;
+  usage?(): ProviderUsage;
+}
+
+interface HarnessArtifact {
+  schema: 1;
+  runId: string;
+  timestamp: string;
+  type: string;
+  [key: string]: unknown;
+}
+
+interface HarnessArtifactPayload {
+  type: string;
+  [key: string]: unknown;
+}
+
+interface DecisionLabel {
+  type: 'turn' | 'communication';
+  sweep?: number;
+  relayCursor?: string;
+}
+
+class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BudgetExceededError';
+  }
 }
 
 const BOT_PERSONAS: BotPersona[] = [
@@ -199,13 +251,169 @@ function getNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function sanitizeRunId(value: string): string {
+  const sanitized = value
+    .replace(/[^A-Za-z0-9_-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '')
+    .slice(0, 80);
+  return sanitized || randomUUID();
+}
+
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, 'sk-[REDACTED]')
+    .replace(
+      /\b[A-Za-z0-9_-]*api[_-]?key[A-Za-z0-9_-]*\s*[:=]\s*["']?[^"'\s,}]+/gi,
+      'apiKey=[REDACTED]',
+    );
+}
+
 function jsonPrompt(value: unknown): string {
   return JSON.stringify(value, null, 2).slice(0, 12_000);
 }
 
 function formatError(error: unknown): string {
-  if (error instanceof Error) return error.stack ?? error.message;
-  return String(error);
+  if (error instanceof Error) return redactSensitiveText(error.stack ?? error.message);
+  return redactSensitiveText(String(error));
+}
+
+async function ensureRunDir(): Promise<void> {
+  if (!ARTIFACTS_ENABLED) return;
+  await mkdir(RUN_DIR, { recursive: true });
+}
+
+async function writeJsonArtifact(fileName: string, value: unknown): Promise<void> {
+  if (!ARTIFACTS_ENABLED) return;
+  await writeFile(path.join(RUN_DIR, fileName), `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function appendJsonlArtifact(fileName: string, value: HarnessArtifactPayload): Promise<void> {
+  if (!ARTIFACTS_ENABLED) return;
+  const event: HarnessArtifact = {
+    schema: 1,
+    runId: RUN_ID,
+    timestamp: new Date().toISOString(),
+    ...value,
+  };
+  await appendFile(path.join(RUN_DIR, fileName), `${JSON.stringify(event)}\n`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function emptyUsage(): ProviderUsage {
+  return { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCostUsd: 0 };
+}
+
+function estimateCostUsd(promptTokens: number, completionTokens: number): number {
+  return (
+    (promptTokens / 1_000_000) * PROMPT_USD_PER_1M +
+    (completionTokens / 1_000_000) * COMPLETION_USD_PER_1M
+  );
+}
+
+function providerUsage(provider: ModelProvider): ProviderUsage {
+  return provider.usage?.() ?? emptyUsage();
+}
+
+function assertCostBudget(provider: ModelProvider): void {
+  if (MAX_COST_USD <= 0) return;
+  const usage = providerUsage(provider);
+  if (usage.estimatedCostUsd > MAX_COST_USD) {
+    throw new BudgetExceededError(
+      `Harness estimated cost ${usage.estimatedCostUsd.toFixed(6)} exceeded HARNESS_MAX_COST_USD=${MAX_COST_USD}`,
+    );
+  }
+}
+
+async function decideWithRetries(
+  provider: ModelProvider,
+  input: ProviderInput,
+  label: DecisionLabel,
+): Promise<ModelDecision> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MODEL_CALL_RETRIES; attempt++) {
+    try {
+      assertCostBudget(provider);
+      const decision = await withTimeout(
+        provider.decide(input),
+        MODEL_CALL_TIMEOUT_MS,
+        `${provider.name} ${input.bot.name} ${label.type} round=${input.round}`,
+      );
+      assertCostBudget(provider);
+      await appendJsonlArtifact('turns.jsonl', {
+        type: 'decision',
+        decisionType: label.type,
+        sweep: label.sweep,
+        relayCursor: label.relayCursor,
+        attempt: attempt + 1,
+        bot: input.bot.name,
+        playerId: input.bot.playerId,
+        persona: input.bot.persona.id,
+        provider: provider.name,
+        model: MODEL,
+        round: input.round,
+        action: decision.action,
+        publicMessageChars: decision.publicMessage.length,
+        privateMessageChars: decision.privateMessage.length,
+        usage: providerUsage(provider),
+      });
+      return decision;
+    } catch (error) {
+      if (error instanceof BudgetExceededError) {
+        await appendJsonlArtifact('errors.jsonl', {
+          type: 'budget_exceeded',
+          decisionType: label.type,
+          sweep: label.sweep,
+          relayCursor: label.relayCursor,
+          attempt: attempt + 1,
+          bot: input.bot.name,
+          playerId: input.bot.playerId,
+          provider: provider.name,
+          model: MODEL,
+          round: input.round,
+          usage: providerUsage(provider),
+          error: formatError(error),
+        });
+        throw error;
+      }
+      lastError = error;
+      await appendJsonlArtifact('errors.jsonl', {
+        type: 'decision_error',
+        decisionType: label.type,
+        sweep: label.sweep,
+        relayCursor: label.relayCursor,
+        attempt: attempt + 1,
+        bot: input.bot.name,
+        playerId: input.bot.playerId,
+        provider: provider.name,
+        model: MODEL,
+        round: input.round,
+        error: formatError(error),
+      });
+      if (attempt >= MODEL_CALL_RETRIES) break;
+      await sleep(500 * (attempt + 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function isMessagingRelay(message: unknown): message is Record<string, unknown> {
@@ -306,12 +514,30 @@ class ScriptedProvider implements ModelProvider {
 }
 
 class OpenAICompatibleProvider implements ModelProvider {
+  private readonly usageStats: ProviderUsage = emptyUsage();
+
   constructor(
     readonly name: 'openai-compatible' | 'minimax',
     private readonly baseUrl: string,
     private readonly apiKey: string,
     private readonly model: string,
   ) {}
+
+  usage(): ProviderUsage {
+    return { ...this.usageStats };
+  }
+
+  private recordUsage(body: unknown): void {
+    if (!isRecord(body) || !isRecord(body.usage)) return;
+    const promptTokens = getNumber(body.usage.prompt_tokens, 0);
+    const completionTokens = getNumber(body.usage.completion_tokens, 0);
+    const totalTokens = getNumber(body.usage.total_tokens, promptTokens + completionTokens);
+    this.usageStats.requests += 1;
+    this.usageStats.promptTokens += promptTokens;
+    this.usageStats.completionTokens += completionTokens;
+    this.usageStats.totalTokens += totalTokens;
+    this.usageStats.estimatedCostUsd += estimateCostUsd(promptTokens, completionTokens);
+  }
 
   async decide(input: ProviderInput): Promise<ModelDecision> {
     const communicationOnly = input.mode === 'communication';
@@ -396,6 +622,7 @@ publicMessage goes to all players. privateMessage plus dmRecipient goes to one s
         `${this.name} ${this.model} returned invalid JSON for ${input.bot.name} ${input.mode} round ${input.round}: ${formatError(error)}; body=${bodyText.slice(0, 500)}`,
       );
     }
+    this.recordUsage(body);
     const choice = isRecord(body) && Array.isArray(body.choices) ? body.choices[0] : undefined;
     const message = isRecord(choice) ? choice.message : undefined;
     const messageRecord = isRecord(message) ? message : {};
@@ -501,6 +728,33 @@ function rotateBots(bots: HarnessBot[], offset: number): HarnessBot[] {
 
 async function callTool(bot: HarnessBot, toolName: string, args: Record<string, unknown>): Promise<unknown> {
   return api(SERVER, '/api/player/tool', { method: 'POST', token: bot.token, body: { toolName, args } });
+}
+
+function gameStateFromInspect(inspectRecord: Record<string, unknown>): Record<string, unknown> {
+  const gameInspect = isRecord(inspectRecord.gameInspect) ? inspectRecord.gameInspect : {};
+  return isRecord(gameInspect.gameState) ? gameInspect.gameState : {};
+}
+
+function currentPlayerIdFromGameState(gameState: Record<string, unknown>): string | undefined {
+  const players = Array.isArray(gameState.players) ? gameState.players : [];
+  const index = typeof gameState.currentPlayerIndex === 'number' ? gameState.currentPlayerIndex : -1;
+  const currentPlayer = players[index];
+  if (!isRecord(currentPlayer)) return undefined;
+  return typeof currentPlayer.id === 'string' ? currentPlayer.id : undefined;
+}
+
+function recordedActionFor(gameState: Record<string, unknown>, playerId: string): Record<string, unknown> | undefined {
+  const submittedActions = isRecord(gameState.submittedActions) ? gameState.submittedActions : {};
+  const recorded = submittedActions[playerId];
+  return isRecord(recorded) ? recorded : undefined;
+}
+
+async function actionRecordedOrTurnAdvanced(gameId: string, playerId: string): Promise<boolean> {
+  const latestInspect = await inspect(gameId);
+  const latestGameState = gameStateFromInspect(latestInspect);
+  if (recordedActionFor(latestGameState, playerId)) return true;
+  const currentPlayerId = currentPlayerIdFromGameState(latestGameState);
+  return currentPlayerId !== undefined && currentPlayerId !== playerId;
 }
 
 function relayIndex(message: Record<string, unknown>): number {
@@ -641,7 +895,15 @@ async function runCommunicationSweeps(
       };
       let decision: ModelDecision;
       try {
-        decision = await provider.decide({ bot, visibleState: communicationState, tools: context.tools, round, mode: 'communication', wakeContext });
+        decision = await decideWithRetries(
+          provider,
+          { bot, visibleState: communicationState, tools: context.tools, round, mode: 'communication', wakeContext },
+          {
+            type: 'communication',
+            sweep: sweep + 1,
+            relayCursor: `${previousCursor}->${context.nextRelayCursor}`,
+          },
+        );
       } catch (error) {
         throw new Error(
           `communication decision failed for ${bot.name} round=${round} sweep=${sweep + 1} relayCursor=${previousCursor}->${context.nextRelayCursor}: ${formatError(error)}`,
@@ -661,9 +923,32 @@ async function runCommunicationSweeps(
 }
 
 async function main(): Promise<void> {
+  await ensureRunDir();
   const provider = createProvider();
   console.log(`model-harness run=${RUN_ID} provider=${provider.name} model=${MODEL}`);
   console.log(`server=${SERVER} game=${GAME_TYPE} bots=${BOT_COUNT}`);
+  if (ARTIFACTS_ENABLED) console.log(`artifacts=${RUN_DIR}`);
+  await writeJsonArtifact('run.config.json', {
+    schema: 1,
+    runId: RUN_ID,
+    server: SERVER,
+    webBaseUrl: WEB_BASE_URL,
+    gameType: GAME_TYPE,
+    botCount: BOT_COUNT,
+    teamSize: TEAM_SIZE,
+    maxRounds: MAX_ROUNDS,
+    communicationSweeps: COMMUNICATION_SWEEPS,
+    provider: provider.name,
+    model: MODEL,
+    botConfigPath: BOT_CONFIG_PATH,
+    appendAddressSuffix: APPEND_ADDRESS_SUFFIX,
+    modelCallTimeoutMs: MODEL_CALL_TIMEOUT_MS,
+    modelCallRetries: MODEL_CALL_RETRIES,
+    maxCostUsd: MAX_COST_USD > 0 ? MAX_COST_USD : undefined,
+    promptUsdPer1M: PROMPT_USD_PER_1M > 0 ? PROMPT_USD_PER_1M : undefined,
+    completionUsdPer1M: COMPLETION_USD_PER_1M > 0 ? COMPLETION_USD_PER_1M : undefined,
+    note: 'No provider API keys, inspector tokens, bot bearer tokens, or wallet private keys are written to artifacts.',
+  });
 
   const bots = await createBots();
   const firstBot = bots[0];
@@ -674,6 +959,13 @@ async function main(): Promise<void> {
   );
   const lobbyId = String(lobby.lobbyId);
   console.log(`lobby=${lobbyId}`);
+  await appendJsonlArtifact('games.jsonl', {
+    type: 'lobby_created',
+    lobbyId,
+    gameType: GAME_TYPE,
+    teamSize: TEAM_SIZE,
+    bots: bots.map((bot) => ({ name: bot.name, playerId: bot.playerId, persona: bot.persona.id })),
+  });
 
   for (const bot of bots) {
     const joined = asRecord(
@@ -688,6 +980,7 @@ async function main(): Promise<void> {
   const gameId = typeof lobbyInspect.gameId === 'string' ? lobbyInspect.gameId : null;
   if (!gameId) throw new Error(`Lobby did not start a game: ${JSON.stringify(lobbyInspect.lobby)}`);
   console.log(`game=${gameId}`);
+  await appendJsonlArtifact('games.jsonl', { type: 'game_started', lobbyId, gameId });
 
   const nextRelayCursorByBot = new Map<string, number>();
   for (const bot of bots) {
@@ -740,19 +1033,23 @@ async function main(): Promise<void> {
       nextRelayCursorByBot.set(activeBot.playerId, context.nextRelayCursor);
       console.log(`  ${activeBot.name}: relayFeed=${turnFeedRelays.length} totalVisibleRelay=${context.relayMessages.length}`);
       const turnWakeContext = buildWakeContext(activeBot, bots, turnFeedRelays);
-      const decision = await provider.decide({
-        bot: activeBot,
-        visibleState,
-        tools: context.tools,
-        round,
-        mode: 'turn',
-        wakeContext: {
-          reason: 'turn',
-          summary: `${activeBot.name} is taking an action turn with ${turnFeedRelays.length} new relay feed item(s) after its last delivered relay cursor.`,
-          privateReplyTo: turnWakeContext.privateReplyTo,
-          messages: turnFeedRelays,
+      const decision = await decideWithRetries(
+        provider,
+        {
+          bot: activeBot,
+          visibleState,
+          tools: context.tools,
+          round,
+          mode: 'turn',
+          wakeContext: {
+            reason: 'turn',
+            summary: `${activeBot.name} is taking an action turn with ${turnFeedRelays.length} new relay feed item(s) after its last delivered relay cursor.`,
+            privateReplyTo: turnWakeContext.privateReplyTo,
+            messages: turnFeedRelays,
+          },
         },
-      });
+        { type: 'turn', relayCursor: `${previousCursor}->${context.nextRelayCursor}` },
+      );
       await publishDecisionMessages(activeBot, bots, decision, provider, turnWakeContext.privateReplyTo);
 
       const { type, ...args } = decision.action;
@@ -762,11 +1059,61 @@ async function main(): Promise<void> {
           console.log(`  ${activeBot.name}: attempting ${toolName} with args ${JSON.stringify(args)}`);
           await callTool(activeBot, toolName, args);
           console.log(`  ${activeBot.name}: ${toolName}`);
+          await appendJsonlArtifact('turns.jsonl', {
+            type: 'action_submitted',
+            bot: activeBot.name,
+            playerId: activeBot.playerId,
+            persona: activeBot.persona.id,
+            round,
+            toolName,
+            args,
+          });
           actedThisRound.add(currentPlayerId);
         } catch (error) {
           console.log(`  ${activeBot.name}: ${toolName} failed, falling back to pass (${String(error).slice(0, 160)})`);
-          await callTool(activeBot, 'pass', {});
-          console.log(`  ${activeBot.name}: pass (fallback)`);
+          try {
+            await callTool(activeBot, 'pass', {});
+            console.log(`  ${activeBot.name}: pass (fallback)`);
+            await appendJsonlArtifact('turns.jsonl', {
+              type: 'action_fallback',
+              bot: activeBot.name,
+              playerId: activeBot.playerId,
+              persona: activeBot.persona.id,
+              round,
+              attemptedToolName: toolName,
+              attemptedArgs: args,
+              fallbackToolName: 'pass',
+              error: formatError(error),
+            });
+          } catch (fallbackError) {
+            if (!(await actionRecordedOrTurnAdvanced(gameId, currentPlayerId))) {
+              await appendJsonlArtifact('errors.jsonl', {
+                type: 'action_fallback_error',
+                bot: activeBot.name,
+                playerId: activeBot.playerId,
+                round,
+                attemptedToolName: toolName,
+                attemptedError: formatError(error),
+                fallbackError: formatError(fallbackError),
+              });
+              throw new Error(
+                `${activeBot.name}: ${toolName} failed (${formatError(error)}) and pass fallback failed (${formatError(fallbackError)})`,
+              );
+            }
+            await appendJsonlArtifact('turns.jsonl', {
+              type: 'action_fallback_observed_success',
+              bot: activeBot.name,
+              playerId: activeBot.playerId,
+              persona: activeBot.persona.id,
+              round,
+              attemptedToolName: toolName,
+              attemptedArgs: args,
+              fallbackToolName: 'pass',
+              attemptedError: formatError(error),
+              fallbackError: formatError(fallbackError),
+            });
+            console.log(`  ${activeBot.name}: pass fallback reported failure, but inspect shows action recorded or turn advanced`);
+          }
           actedThisRound.add(currentPlayerId);
         }
       } else {
@@ -784,24 +1131,24 @@ async function main(): Promise<void> {
   const relayMessages = Array.isArray(finalDiagnostics.relayMessages) ? finalDiagnostics.relayMessages : [];
   const messagingRelays = relayMessages.filter(isMessagingRelay);
   const modelChatMessages = messagingRelays.filter((message) => !isSystemRelay(message));
-  console.log(
-    JSON.stringify(
-      {
-        runId: RUN_ID,
-        lobbyId,
-        gameId,
-        inspectUrl: `${WEB_BASE_URL}/inspect/${gameId}`,
-        gameUrl: `${WEB_BASE_URL}/game/${gameId}`,
-        reasoningMessages: relayMessages.filter((message) => isRecord(message) && message.type === 'reasoning').length,
-        chatMessages: modelChatMessages.length,
-        publicMessages: modelChatMessages.filter((message) => !isDmRelay(message)).length,
-        dmMessages: modelChatMessages.filter(isDmRelay).length,
-        systemMessages: messagingRelays.filter(isSystemRelay).length,
-      },
-      null,
-      2,
-    ),
-  );
+  const summary = {
+    runId: RUN_ID,
+    lobbyId,
+    gameId,
+    inspectUrl: `${WEB_BASE_URL}/inspect/${gameId}`,
+    gameUrl: `${WEB_BASE_URL}/game/${gameId}`,
+    artifactDir: ARTIFACTS_ENABLED ? RUN_DIR : undefined,
+    reasoningMessages: relayMessages.filter((message) => isRecord(message) && message.type === 'reasoning').length,
+    chatMessages: modelChatMessages.length,
+    publicMessages: modelChatMessages.filter((message) => !isDmRelay(message)).length,
+    dmMessages: modelChatMessages.filter(isDmRelay).length,
+    systemMessages: messagingRelays.filter(isSystemRelay).length,
+    usage: providerUsage(provider),
+  };
+  await writeJsonArtifact('summary.json', summary);
+  await writeJsonArtifact('costs.json', providerUsage(provider));
+  await appendJsonlArtifact('games.jsonl', { type: 'game_finished', lobbyId, gameId, summary });
+  console.log(JSON.stringify(summary, null, 2));
 }
 
 main().catch((error) => {
