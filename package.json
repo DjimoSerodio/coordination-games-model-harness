@@ -8,6 +8,7 @@
   },
   "scripts": {
     "harness:model": "tsx src/index.ts",
+    "gui": "tsx src/gui.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit"
   },
