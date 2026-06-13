@@ -73,6 +73,36 @@ HARNESS_COMPLETION_USD_PER_1M=0.60  # optional estimate only
 
 Artifacts intentionally exclude provider API keys, inspector tokens, bot bearer tokens, and wallet private keys.
 
+## Local GUI configurator
+
+Start the local-only browser configurator:
+
+```bash
+npm run gui
+```
+
+Then open:
+
+```text
+http://127.0.0.1:4317
+```
+
+The GUI lets you configure the same harness knobs from the browser, launch the existing CLI as a child process, stream stdout/stderr, stop running jobs, and jump to the artifact directory shown in the run metadata.
+
+Security boundaries:
+
+- The GUI binds to `127.0.0.1` by default.
+- API keys and inspector tokens are never stored in files, browser localStorage, or run metadata.
+- Secrets entered in the form are passed only to the harness child process for that run, then the browser field is cleared.
+- Run logs are redacted before being streamed to the browser.
+
+Optional GUI env vars:
+
+```bash
+HARNESS_GUI_PORT=4317
+HARNESS_GUI_HOST=127.0.0.1
+```
+
 ## Bot configuration
 
 Set `BOT_CONFIG` to a JSON file so you can tweak local bot names, personas, and speech style without touching Lucian's repo:
