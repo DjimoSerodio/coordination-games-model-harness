@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readdir } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
@@ -10,6 +10,7 @@ const PORT = Number.parseInt(process.env.HARNESS_GUI_PORT ?? '4317', 10);
 const HOST = process.env.HARNESS_GUI_HOST ?? '127.0.0.1';
 const ROOT = process.cwd();
 const TSX_BIN = path.join(ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
+const DEFAULT_RUNTIME_DIR = path.resolve(process.env.HARNESS_GAME_RUNTIME_DIR ?? path.resolve(ROOT, '..', 'Coordination game'));
 
 type RunStatus = 'running' | 'completed' | 'failed' | 'stopped';
 
@@ -32,7 +33,35 @@ interface RunRecord {
   clients: Set<ServerResponse>;
 }
 
+interface BotEditorConfig {
+  name: string;
+  id: string;
+  title: string;
+  instruction: string;
+  publicStyle: string;
+  privateStyle: string;
+}
+
+interface RuntimeRecord {
+  status: 'stopped' | 'starting' | 'running' | 'failed';
+  runtimeDir: string;
+  command: string;
+  startedAt: string | null;
+  exitCode: number | null;
+  child: ChildProcessByStdio<null, Readable, Readable> | null;
+  logs: LogEntry[];
+}
+
 const runs = new Map<string, RunRecord>();
+let runtime: RuntimeRecord = {
+  status: 'stopped',
+  runtimeDir: DEFAULT_RUNTIME_DIR,
+  command: 'npm run dev',
+  startedAt: null,
+  exitCode: null,
+  child: null,
+  logs: [],
+};
 
 function redact(value: string): string {
   return value
@@ -72,7 +101,10 @@ function sendNotFound(res: ServerResponse): void {
 }
 
 function appendLog(run: RunRecord, stream: LogEntry['stream'], text: string): void {
-  const entry: LogEntry = { stream, text: redact(text), timestamp: new Date().toISOString() };
+  const hint = text.includes('TypeError: fetch failed')
+    ? `${text}\n[harness gui hint] The harness could not reach GAME_SERVER. Use “Check runtime” or “Start runtime”, then retry the run.\n`
+    : text;
+  const entry: LogEntry = { stream, text: redact(hint), timestamp: new Date().toISOString() };
   run.logs.push(entry);
   if (run.logs.length > 1_000) run.logs.shift();
   broadcast(run, 'log', entry);
@@ -114,6 +146,131 @@ function assertSafeRelativePath(value: string, label: string): string {
     throw new Error(`${label} cannot escape the harness repo`);
   }
   return normalized;
+}
+
+function assertSafeRuntimeDir(value: string): string {
+  const runtimeDir = value.trim() ? path.resolve(value.trim()) : DEFAULT_RUNTIME_DIR;
+  return runtimeDir;
+}
+
+function parseBots(raw: unknown): BotEditorConfig[] | null {
+  if (!Array.isArray(raw)) return null;
+  const bots = raw.filter(isRecord).map((bot, index): BotEditorConfig => ({
+    name: optionalString(bot, 'name', `Harness Bot ${index + 1}`),
+    id: optionalString(bot, 'id', `bot-${index + 1}`),
+    title: optionalString(bot, 'title', `Harness Bot ${index + 1}`),
+    instruction: optionalString(bot, 'instruction', 'Play the game according to your persona.'),
+    publicStyle: optionalString(bot, 'publicStyle', 'I am ready to coordinate.'),
+    privateStyle: optionalString(bot, 'privateStyle', 'I am looking for reliable partners.'),
+  }));
+  return bots.length > 0 ? bots : null;
+}
+
+async function writeGeneratedBotConfig(runId: string, bots: BotEditorConfig[]): Promise<string> {
+  const dir = path.join(ROOT, 'runs', 'gui-configs');
+  await mkdir(dir, { recursive: true });
+  const relativePath = path.join('runs', 'gui-configs', `${runId}.bots.json`);
+  await writeFile(path.join(ROOT, relativePath), `${JSON.stringify({ bots }, null, 2)}\n`);
+  return relativePath;
+}
+
+async function loadDefaultBots(): Promise<BotEditorConfig[]> {
+  const examplePath = path.join(ROOT, 'examples', 'tragedy-bots.example.json');
+  try {
+    const parsed: unknown = JSON.parse(await readFile(examplePath, 'utf8'));
+    const rawBots = isRecord(parsed) && Array.isArray(parsed.bots) ? parsed.bots : Array.isArray(parsed) ? parsed : [];
+    return parseBots(rawBots) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function appendRuntimeLog(stream: LogEntry['stream'], text: string): void {
+  runtime.logs.push({ stream, text: redact(text), timestamp: new Date().toISOString() });
+  if (runtime.logs.length > 300) runtime.logs.shift();
+}
+
+async function runtimeStatus(gameServer: string): Promise<Record<string, unknown>> {
+  let serverReachable = false;
+  let serverError = '';
+  try {
+    const response = await fetch(gameServer, { signal: AbortSignal.timeout(1500) });
+    serverReachable = response.status < 500;
+  } catch (error) {
+    serverError = error instanceof Error ? error.message : String(error);
+  }
+  return {
+    status: runtime.status,
+    runtimeDir: runtime.runtimeDir,
+    command: runtime.command,
+    startedAt: runtime.startedAt,
+    exitCode: runtime.exitCode,
+    serverReachable,
+    serverError,
+    logs: runtime.logs,
+  };
+}
+
+async function startRuntime(raw: unknown): Promise<Record<string, unknown>> {
+  if (!isRecord(raw)) throw new Error('Runtime payload must be an object');
+  if (runtime.child && runtime.status !== 'stopped' && runtime.status !== 'failed') return runtimeStatus(optionalString(raw, 'gameServer', 'http://127.0.0.1:8787'));
+  const runtimeDir = assertSafeRuntimeDir(optionalString(raw, 'runtimeDir', DEFAULT_RUNTIME_DIR));
+  await access(runtimeDir);
+  const command = optionalString(raw, 'runtimeCommand', 'npm run dev');
+  const commandMap: Record<string, { bin: string; args: string[]; label: string }> = {
+    'npm run dev': { bin: 'npm', args: ['run', 'dev'], label: 'npm run dev' },
+    'npm run dev --workspace=packages/workers-server': {
+      bin: 'npm',
+      args: ['run', 'dev', '--workspace=packages/workers-server'],
+      label: 'npm run dev --workspace=packages/workers-server',
+    },
+  };
+  const selected = commandMap[command] ?? commandMap['npm run dev'];
+  if (!selected) throw new Error(`Unsupported runtime command: ${command}`);
+  const child = spawn(selected.bin, selected.args, { cwd: runtimeDir, stdio: ['ignore', 'pipe', 'pipe'] });
+  runtime = {
+    status: 'starting',
+    runtimeDir,
+    command: selected.label,
+    startedAt: new Date().toISOString(),
+    exitCode: null,
+    child,
+    logs: [],
+  };
+  appendRuntimeLog('system', `Starting game runtime in ${runtimeDir}: ${selected.label}`);
+  child.stdout.on('data', (chunk) => appendRuntimeLog('stdout', chunk.toString('utf8')));
+  child.stderr.on('data', (chunk) => appendRuntimeLog('stderr', chunk.toString('utf8')));
+  child.on('error', (error) => {
+    runtime.status = 'failed';
+    appendRuntimeLog('system', `Runtime failed: ${error.message}`);
+  });
+  child.on('close', (code) => {
+    runtime.status = code === 0 ? 'stopped' : 'failed';
+    runtime.exitCode = code;
+    runtime.child = null;
+    appendRuntimeLog('system', `Runtime exited with code ${code ?? 'unknown'}`);
+  });
+  setTimeout(() => {
+    if (runtime.child && runtime.status === 'starting') runtime.status = 'running';
+  }, 1000);
+  return runtimeStatus(optionalString(raw, 'gameServer', 'http://127.0.0.1:8787'));
+}
+
+function stopRuntime(): Record<string, unknown> {
+  if (runtime.child) {
+    runtime.child.kill('SIGTERM');
+    runtime.status = 'stopped';
+    runtime.child = null;
+    appendRuntimeLog('system', 'Stop requested from GUI');
+  }
+  return {
+    status: runtime.status,
+    runtimeDir: runtime.runtimeDir,
+    command: runtime.command,
+    startedAt: runtime.startedAt,
+    exitCode: runtime.exitCode,
+    logs: runtime.logs,
+  };
 }
 
 function envFromConfig(raw: Record<string, unknown>, runId: string): { env: NodeJS.ProcessEnv; publicConfig: Record<string, string | boolean> } {
@@ -211,7 +368,14 @@ async function startRun(raw: unknown): Promise<RunRecord> {
   const requestedId = optionalString(raw, 'runId', `gui-${new Date().toISOString().replace(/[:.]/g, '-')}`);
   const runId = sanitizeRunId(requestedId);
   if (runs.has(runId)) throw new Error(`Run already exists: ${runId}`);
-  const { env, publicConfig } = envFromConfig(raw, runId);
+  const bots = parseBots(raw.bots);
+  const effectiveRaw: Record<string, unknown> = { ...raw };
+  if (bots) {
+    effectiveRaw.botConfig = await writeGeneratedBotConfig(runId, bots);
+    effectiveRaw.botCount = String(bots.length);
+  }
+  const { env, publicConfig } = envFromConfig(effectiveRaw, runId);
+  if (bots) publicConfig.inlineBots = String(bots.length);
   const artifactDir = path.join(env.HARNESS_RESULTS_DIR ?? 'runs/model-harness', runId);
   const child = spawn(TSX_BIN, ['src/index.ts'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const run: RunRecord = {
@@ -262,6 +426,11 @@ async function stopRun(id: string): Promise<RunRecord> {
 async function sendDefaults(res: ServerResponse): Promise<void> {
   sendJson(res, 200, {
     botConfigs: await botConfigOptions(),
+    bots: await loadDefaultBots(),
+    runtime: {
+      runtimeDir: DEFAULT_RUNTIME_DIR,
+      runtimeCommand: 'npm run dev',
+    },
     defaults: {
       provider: 'scripted',
       gameServer: 'http://127.0.0.1:8787',
@@ -308,6 +477,18 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
     if (req.method === 'GET' && url.pathname === '/api/defaults') {
       await sendDefaults(res);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/runtime/status') {
+      sendJson(res, 200, await runtimeStatus(url.searchParams.get('gameServer') ?? 'http://127.0.0.1:8787'));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/runtime/start') {
+      sendJson(res, 200, await startRuntime(await readBody(req)));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/runtime/stop') {
+      sendJson(res, 200, stopRuntime());
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/runs') {
@@ -364,6 +545,12 @@ function htmlPage(): string {
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .check { display: flex; gap: 10px; align-items: center; text-transform: none; letter-spacing: 0; font-size: 13px; }
     .check input { width: auto; }
+    textarea { width: 100%; min-height: 86px; resize: vertical; border: 1px solid var(--line); background: #100e0a; color: var(--ink); padding: 10px 11px; font: inherit; font-size: 12px; outline: none; }
+    textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(243,184,91,.16); }
+    .bot-card { border: 1px solid rgba(243, 184, 91, .2); padding: 12px; display: grid; gap: 10px; background: rgba(0,0,0,.16); }
+    .bot-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .bot-card-head strong { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
+    .runtime-line { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
     button { border: 1px solid var(--accent); background: var(--accent); color: #151006; font-weight: 800; padding: 12px 14px; cursor: pointer; font: inherit; text-transform: uppercase; letter-spacing: .08em; }
     button.secondary { background: transparent; color: var(--accent); }
     button:disabled { opacity: .45; cursor: not-allowed; }
@@ -394,12 +581,23 @@ function htmlPage(): string {
   <div class="grid">
     <section>
       <form id="run-form">
+        <div class="fieldset"><h2>Game runtime</h2>
+          <label>Runtime directory <input name="runtimeDir" /></label>
+          <label>Runtime command <select name="runtimeCommand"><option value="npm run dev">npm run dev</option><option value="npm run dev --workspace=packages/workers-server">npm run dev --workspace=packages/workers-server</option></select></label>
+          <div class="runtime-line"><button class="secondary" id="runtime-status" type="button">Check runtime</button><button class="secondary" id="runtime-start" type="button">Start runtime</button><button class="secondary" id="runtime-stop" type="button">Stop runtime</button></div>
+          <p class="note" id="runtime-note">Runtime not checked yet. A fetch failure means the game server is not reachable at the Game server URL.</p>
+        </div>
         <div class="fieldset"><h2>Run</h2>
           <label>Run ID <input name="runId" placeholder="gui-smoke-run" /></label>
           <div class="row"><label>Game server <input name="gameServer" /></label><label>Web URL <input name="webBaseUrl" /></label></div>
           <div class="row"><label>Game type <input name="gameType" /></label><label>Bot config <select name="botConfig"></select></label></div>
           <div class="row"><label>Rounds <input name="rounds" inputmode="numeric" /></label><label>Communication sweeps <input name="communicationSweeps" inputmode="numeric" /></label></div>
           <label class="check"><input type="checkbox" name="appendAddressSuffix" /> Append wallet suffix to bot names</label>
+        </div>
+        <div class="fieldset"><h2>Bots + personas</h2>
+          <p class="note">Edit each bot directly here. On run start, the GUI writes an ignored per-run bot config under <code>runs/gui-configs/</code> and passes it to the harness.</p>
+          <div id="bot-editor" style="display:grid;gap:12px"></div>
+          <div class="runtime-line"><button class="secondary" id="add-bot" type="button">Add bot</button><button class="secondary" id="reset-bots" type="button">Reset example bots</button></div>
         </div>
         <div class="fieldset"><h2>Provider</h2>
           <div class="row"><label>Provider <select name="provider"><option value="scripted">scripted</option><option value="minimax">minimax</option><option value="openai-compatible">openai-compatible</option></select></label><label>Model <input name="model" /></label></div>
@@ -431,7 +629,11 @@ const terminal = document.querySelector('#terminal');
 const meta = document.querySelector('#meta');
 const serverStatus = document.querySelector('#server-status');
 const startButton = document.querySelector('#start-button');
+const botEditor = document.querySelector('#bot-editor');
+const runtimeNote = document.querySelector('#runtime-note');
 let runs = [];
+let defaultBots = [];
+let bots = [];
 let activeRunId = null;
 let source = null;
 
@@ -440,6 +642,36 @@ function setValue(name, value) { const el = field(name); if (!el) return; if (el
 function valueOf(name) { const el = field(name); if (!el) return ''; return el.type === 'checkbox' ? el.checked : el.value; }
 function lineClass(stream) { return stream === 'stderr' ? 'stderr' : stream === 'system' ? 'system' : 'stdout'; }
 function escapeHtml(text) { return String(text).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch])); }
+
+function blankBot(index) { return { name: 'Harness Bot ' + (index + 1), id: 'bot-' + (index + 1), title: 'Custom persona', instruction: 'Play the game according to your persona.', publicStyle: 'I am ready to coordinate.', privateStyle: 'I am looking for reliable partners.' }; }
+function renderBots() {
+  botEditor.innerHTML = bots.map((bot, index) => '<div class="bot-card" data-index="' + index + '"><div class="bot-card-head"><strong>Bot ' + (index + 1) + '</strong><button class="secondary remove-bot" type="button">Remove</button></div><div class="row"><label>Name <input data-bot-field="name" value="' + escapeHtml(bot.name) + '" /></label><label>ID <input data-bot-field="id" value="' + escapeHtml(bot.id) + '" /></label></div><label>Title <input data-bot-field="title" value="' + escapeHtml(bot.title) + '" /></label><label>Instruction <textarea data-bot-field="instruction">' + escapeHtml(bot.instruction) + '</textarea></label><label>Public style <textarea data-bot-field="publicStyle">' + escapeHtml(bot.publicStyle) + '</textarea></label><label>Private style <textarea data-bot-field="privateStyle">' + escapeHtml(bot.privateStyle) + '</textarea></label></div>').join('');
+}
+function collectBots() {
+  return [...botEditor.querySelectorAll('.bot-card')].map((card, index) => {
+    const read = name => card.querySelector('[data-bot-field="' + name + '"]').value.trim();
+    return { name: read('name') || 'Harness Bot ' + (index + 1), id: read('id') || 'bot-' + (index + 1), title: read('title') || 'Custom persona', instruction: read('instruction') || 'Play the game according to your persona.', publicStyle: read('publicStyle'), privateStyle: read('privateStyle') };
+  });
+}
+function runtimePayload() { return { runtimeDir: valueOf('runtimeDir'), runtimeCommand: valueOf('runtimeCommand'), gameServer: valueOf('gameServer') }; }
+async function refreshRuntimeStatus() {
+  const response = await fetch('/api/runtime/status?gameServer=' + encodeURIComponent(valueOf('gameServer')));
+  const status = await response.json();
+  runtimeNote.textContent = status.serverReachable ? 'Game server reachable at ' + valueOf('gameServer') + '. Runtime status: ' + status.status + '.' : 'Game server NOT reachable at ' + valueOf('gameServer') + '. Runtime status: ' + status.status + (status.serverError ? ' · ' + status.serverError : '') + '.';
+  return status;
+}
+async function startRuntime() {
+  runtimeNote.textContent = 'Starting runtime...';
+  const response = await fetch('/api/runtime/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(runtimePayload()) });
+  const status = await response.json();
+  if (!response.ok) throw new Error(status.error || 'Runtime failed to start');
+  runtimeNote.textContent = 'Runtime start requested. Rechecking server...';
+  setTimeout(refreshRuntimeStatus, 1800);
+}
+async function stopRuntime() {
+  await fetch('/api/runtime/stop', { method: 'POST' });
+  await refreshRuntimeStatus();
+}
 
 function renderRuns() {
   runList.innerHTML = runs.map(run => '<div class="run-card ' + (run.id === activeRunId ? 'active' : '') + '" data-id="' + run.id + '"><span class="pill ' + run.status + '">' + run.status + '</span><div style="margin-top:8px">' + run.id + '</div><div class="note">' + run.config.provider + ' · ' + run.config.model + '</div></div>').join('');
@@ -482,6 +714,26 @@ runList.addEventListener('click', event => {
   attachEvents(activeRunId);
   renderRuns(); renderActive(runs.find(run => run.id === activeRunId));
 });
+botEditor.addEventListener('click', event => {
+  const remove = event.target.closest('.remove-bot');
+  if (!remove) return;
+  const card = event.target.closest('.bot-card');
+  const index = Number(card.dataset.index);
+  bots = collectBots().filter((_, botIndex) => botIndex !== index);
+  renderBots();
+});
+document.querySelector('#add-bot').addEventListener('click', () => {
+  bots = collectBots();
+  bots.push(blankBot(bots.length));
+  renderBots();
+});
+document.querySelector('#reset-bots').addEventListener('click', () => {
+  bots = defaultBots.map(bot => ({ ...bot }));
+  renderBots();
+});
+document.querySelector('#runtime-status').addEventListener('click', () => { void refreshRuntimeStatus(); });
+document.querySelector('#runtime-start').addEventListener('click', () => { startRuntime().catch(error => { runtimeNote.textContent = error.message; }); });
+document.querySelector('#runtime-stop').addEventListener('click', () => { stopRuntime().catch(error => { runtimeNote.textContent = error.message; }); });
 form.addEventListener('submit', async event => {
   event.preventDefault();
   startButton.disabled = true;
@@ -489,6 +741,8 @@ form.addEventListener('submit', async event => {
   const payload = Object.fromEntries(new FormData(form).entries());
   payload.appendAddressSuffix = valueOf('appendAddressSuffix');
   payload.artifactsEnabled = valueOf('artifactsEnabled');
+  payload.bots = collectBots();
+  payload.botCount = String(payload.bots.length);
   try {
     const response = await fetch('/api/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const run = await response.json();
@@ -499,9 +753,14 @@ form.addEventListener('submit', async event => {
 });
 fetch('/api/defaults').then(res => res.json()).then(data => {
   for (const [key, value] of Object.entries(data.defaults)) setValue(key, value);
+  for (const [key, value] of Object.entries(data.runtime)) setValue(key, value);
   const select = field('botConfig');
   select.innerHTML = data.botConfigs.map(value => '<option value="' + value + '">' + value + '</option>').join('');
   setValue('botConfig', data.defaults.botConfig);
+  defaultBots = data.bots && data.bots.length ? data.bots : [blankBot(0), blankBot(1), blankBot(2), blankBot(3)];
+  bots = defaultBots.map(bot => ({ ...bot }));
+  renderBots();
+  void refreshRuntimeStatus();
   return loadRuns();
 });
 </script>

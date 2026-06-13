@@ -89,6 +89,13 @@ http://127.0.0.1:4317
 
 The GUI lets you configure the same harness knobs from the browser, launch the existing CLI as a child process, stream stdout/stderr, stop running jobs, and jump to the artifact directory shown in the run metadata.
 
+It also includes:
+
+- local game-runtime status/start/stop controls for the sibling Coordination Games repo
+- inline multi-bot/persona editing
+- generated per-run bot config files under ignored `runs/gui-configs/`
+- clearer hints when `GAME_SERVER` is unreachable
+
 Security boundaries:
 
 - The GUI binds to `127.0.0.1` by default.
@@ -101,6 +108,7 @@ Optional GUI env vars:
 ```bash
 HARNESS_GUI_PORT=4317
 HARNESS_GUI_HOST=127.0.0.1
+HARNESS_GAME_RUNTIME_DIR="/Users/djimoserodio/Documents/Coordination game"
 ```
 
 ## Bot configuration
