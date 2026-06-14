@@ -92,6 +92,8 @@ The GUI lets you configure the same harness knobs from the browser, launch the e
 It also includes:
 
 - local game-runtime status/start/stop controls for the sibling Coordination Games repo
+- a separate **Start runtime only** control and **Start runtime + run** control, because starting the runtime only starts the game server and does not create a lobby/game
+- automatic detection of Wrangler's actual `Ready on ...` URL when the default `GAME_SERVER` port is already occupied
 - inline multi-bot/persona editing
 - generated per-run bot config files under ignored `runs/gui-configs/`
 - clearer hints when `GAME_SERVER` is unreachable

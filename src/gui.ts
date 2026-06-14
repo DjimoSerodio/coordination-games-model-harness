@@ -48,6 +48,7 @@ interface RuntimeRecord {
   command: string;
   startedAt: string | null;
   exitCode: number | null;
+  detectedServerUrl: string | null;
   child: ChildProcessByStdio<null, Readable, Readable> | null;
   logs: LogEntry[];
 }
@@ -59,15 +60,33 @@ let runtime: RuntimeRecord = {
   command: 'npm run dev',
   startedAt: null,
   exitCode: null,
+  detectedServerUrl: null,
   child: null,
   logs: [],
 };
 
 function redact(value: string): string {
   return value
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (match) => redactUrl(match))
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, 'sk-[REDACTED]')
     .replace(/\b[A-Za-z0-9_-]*api[_-]?key[A-Za-z0-9_-]*\s*[:=]\s*["']?[^"'\s,}]+/gi, 'apiKey=[REDACTED]');
+}
+
+function redactUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.username || parsed.password) {
+      parsed.username = parsed.username ? '[REDACTED]' : '';
+      parsed.password = parsed.password ? '[REDACTED]' : '';
+    }
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/token|key|secret|password|credential|auth/i.test(key)) parsed.searchParams.set(key, '[REDACTED]');
+    }
+    return parsed.toString().replace(/\/$/, parsed.pathname === '/' && !parsed.search ? '' : '/');
+  } catch {
+    return value;
+  }
 }
 
 function sanitizeRunId(value: string): string {
@@ -153,6 +172,29 @@ function assertSafeRuntimeDir(value: string): string {
   return runtimeDir;
 }
 
+function hasSensitiveQuery(parsed: URL): boolean {
+  return [...parsed.searchParams.keys()].some((key) => /token|key|secret|password|credential|auth/i.test(key));
+}
+
+function safeLoopbackHttpUrl(value: string): { url: string | null; error: string | null } {
+  try {
+    const parsed = new URL(value.trim());
+    if (!['http:', 'https:'].includes(parsed.protocol)) return { url: null, error: 'Only http(s) game server URLs are allowed for GUI health checks' };
+    if (parsed.username || parsed.password) return { url: null, error: 'Game server URLs with credentials are not allowed' };
+    if (hasSensitiveQuery(parsed)) return { url: null, error: 'Game server URLs with sensitive query parameters are not allowed' };
+    if (!isLoopbackHost(parsed.hostname)) return { url: null, error: `GUI health checks are limited to loopback hosts, got ${parsed.hostname}` };
+    parsed.hash = '';
+    return { url: parsed.toString().replace(/\/$/, ''), error: null };
+  } catch {
+    return { url: null, error: `Invalid game server URL: ${value}` };
+  }
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  return normalized === 'localhost' || normalized === '::1' || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
 function parseBots(raw: unknown): BotEditorConfig[] | null {
   if (!Array.isArray(raw)) return null;
   const bots = raw.filter(isRecord).map((bot, index): BotEditorConfig => ({
@@ -186,18 +228,33 @@ async function loadDefaultBots(): Promise<BotEditorConfig[]> {
 }
 
 function appendRuntimeLog(stream: LogEntry['stream'], text: string): void {
+  const readyMatch = text.match(/Ready on\s+(https?:\/\/[^\s]+)/i);
+  if (readyMatch?.[1]) runtime.detectedServerUrl = readyMatch[1].replace(/\/$/, '');
   runtime.logs.push({ stream, text: redact(text), timestamp: new Date().toISOString() });
   if (runtime.logs.length > 300) runtime.logs.shift();
 }
 
 async function runtimeStatus(gameServer: string): Promise<Record<string, unknown>> {
+  const requested = safeLoopbackHttpUrl(gameServer);
+  const detected = runtime.detectedServerUrl ? safeLoopbackHttpUrl(runtime.detectedServerUrl) : { url: null, error: null };
+  const requestedGameServer = requested.url ?? redactUrl(gameServer.replace(/\/$/, ''));
+  const candidateServers = [...new Set([detected.url, requested.url].filter((value): value is string => Boolean(value)))];
   let serverReachable = false;
-  let serverError = '';
-  try {
-    const response = await fetch(gameServer, { signal: AbortSignal.timeout(1500) });
-    serverReachable = response.status < 500;
-  } catch (error) {
-    serverError = error instanceof Error ? error.message : String(error);
+  let serverError = requested.error ?? detected.error ?? '';
+  let effectiveGameServer = requestedGameServer;
+  for (const candidate of candidateServers) {
+    try {
+      const response = await fetch(candidate, { redirect: 'manual', signal: AbortSignal.timeout(1500) });
+      if (response.status < 500) {
+        serverReachable = true;
+        effectiveGameServer = candidate;
+        serverError = '';
+        break;
+      }
+      serverError = `${redactUrl(candidate)} returned ${response.status}`;
+    } catch (error) {
+      serverError = error instanceof Error ? error.message : String(error);
+    }
   }
   return {
     status: runtime.status,
@@ -205,6 +262,9 @@ async function runtimeStatus(gameServer: string): Promise<Record<string, unknown
     command: runtime.command,
     startedAt: runtime.startedAt,
     exitCode: runtime.exitCode,
+    requestedGameServer,
+    detectedServerUrl: detected.url,
+    effectiveGameServer,
     serverReachable,
     serverError,
     logs: runtime.logs,
@@ -234,6 +294,7 @@ async function startRuntime(raw: unknown): Promise<Record<string, unknown>> {
     command: selected.label,
     startedAt: new Date().toISOString(),
     exitCode: null,
+    detectedServerUrl: null,
     child,
     logs: [],
   };
@@ -269,6 +330,7 @@ function stopRuntime(): Record<string, unknown> {
     command: runtime.command,
     startedAt: runtime.startedAt,
     exitCode: runtime.exitCode,
+    detectedServerUrl: runtime.detectedServerUrl,
     logs: runtime.logs,
   };
 }
@@ -584,8 +646,8 @@ function htmlPage(): string {
         <div class="fieldset"><h2>Game runtime</h2>
           <label>Runtime directory <input name="runtimeDir" /></label>
           <label>Runtime command <select name="runtimeCommand"><option value="npm run dev">npm run dev</option><option value="npm run dev --workspace=packages/workers-server">npm run dev --workspace=packages/workers-server</option></select></label>
-          <div class="runtime-line"><button class="secondary" id="runtime-status" type="button">Check runtime</button><button class="secondary" id="runtime-start" type="button">Start runtime</button><button class="secondary" id="runtime-stop" type="button">Stop runtime</button></div>
-          <p class="note" id="runtime-note">Runtime not checked yet. A fetch failure means the game server is not reachable at the Game server URL.</p>
+          <div class="runtime-line"><button class="secondary" id="runtime-status" type="button">Check runtime</button><button class="secondary" id="runtime-start" type="button">Start runtime only</button><button class="secondary" id="runtime-start-run" type="button">Start runtime + run</button><button class="secondary" id="runtime-stop" type="button">Stop runtime</button></div>
+          <p class="note" id="runtime-note">Runtime not checked yet. Starting runtime only starts the game server; it does not create a lobby or harness run.</p>
         </div>
         <div class="fieldset"><h2>Run</h2>
           <label>Run ID <input name="runId" placeholder="gui-smoke-run" /></label>
@@ -612,7 +674,7 @@ function htmlPage(): string {
           <label>Completion $ / 1M <input name="completionUsdPer1M" /></label>
           <label class="check"><input type="checkbox" name="artifactsEnabled" /> Write artifacts</label>
         </div>
-        <button id="start-button" type="submit">Start run</button>
+        <button id="start-button" type="submit">Start run — creates lobby/game</button>
         <p class="note">Secrets are never stored in GUI state or run metadata. They are passed to the harness subprocess only for the selected run.</p>
       </form>
     </section>
@@ -654,10 +716,16 @@ function collectBots() {
   });
 }
 function runtimePayload() { return { runtimeDir: valueOf('runtimeDir'), runtimeCommand: valueOf('runtimeCommand'), gameServer: valueOf('gameServer') }; }
+function applyRuntimeStatus(status) {
+  if (status.effectiveGameServer && status.effectiveGameServer !== valueOf('gameServer')) setValue('gameServer', status.effectiveGameServer);
+  const server = status.effectiveGameServer || valueOf('gameServer');
+  const detected = status.detectedServerUrl && status.detectedServerUrl !== status.requestedGameServer ? ' Wrangler selected ' + status.detectedServerUrl + '; the Run Game server field was updated.' : '';
+  runtimeNote.textContent = status.serverReachable ? 'Game server reachable at ' + server + '. Runtime status: ' + status.status + '. Runtime-only does not create a lobby; use Start run to create one.' + detected : 'Game server NOT reachable at ' + valueOf('gameServer') + '. Runtime status: ' + status.status + (status.serverError ? ' · ' + status.serverError : '') + '. Start runtime only starts the server; Start run creates the lobby/game.' + detected;
+}
 async function refreshRuntimeStatus() {
   const response = await fetch('/api/runtime/status?gameServer=' + encodeURIComponent(valueOf('gameServer')));
   const status = await response.json();
-  runtimeNote.textContent = status.serverReachable ? 'Game server reachable at ' + valueOf('gameServer') + '. Runtime status: ' + status.status + '.' : 'Game server NOT reachable at ' + valueOf('gameServer') + '. Runtime status: ' + status.status + (status.serverError ? ' · ' + status.serverError : '') + '.';
+  applyRuntimeStatus(status);
   return status;
 }
 async function startRuntime() {
@@ -665,12 +733,46 @@ async function startRuntime() {
   const response = await fetch('/api/runtime/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(runtimePayload()) });
   const status = await response.json();
   if (!response.ok) throw new Error(status.error || 'Runtime failed to start');
-  runtimeNote.textContent = 'Runtime start requested. Rechecking server...';
+  applyRuntimeStatus(status);
+  runtimeNote.textContent += ' Rechecking for Wrangler ready URL...';
   setTimeout(refreshRuntimeStatus, 1800);
 }
 async function stopRuntime() {
   await fetch('/api/runtime/stop', { method: 'POST' });
   await refreshRuntimeStatus();
+}
+async function submitRun() {
+  startButton.disabled = true;
+  serverStatus.textContent = 'starting';
+  const payload = Object.fromEntries(new FormData(form).entries());
+  payload.appendAddressSuffix = valueOf('appendAddressSuffix');
+  payload.artifactsEnabled = valueOf('artifactsEnabled');
+  payload.bots = collectBots();
+  payload.botCount = String(payload.bots.length);
+  try {
+    const status = await refreshRuntimeStatus();
+    if (status.serverReachable && status.effectiveGameServer) payload.gameServer = status.effectiveGameServer;
+    const response = await fetch('/api/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const run = await response.json();
+    if (!response.ok) throw new Error(run.error || 'Run failed to start');
+    runs.unshift(run); activeRunId = run.id; attachEvents(run.id); renderRuns(); renderActive(run); serverStatus.textContent = 'running';
+  } catch (error) { serverStatus.textContent = error.message; }
+  finally { startButton.disabled = false; field('apiKey').value = ''; }
+}
+async function waitForRuntimeReady(timeoutMs = 45000, intervalMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  let status = await refreshRuntimeStatus();
+  while (!status.serverReachable && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    status = await refreshRuntimeStatus();
+  }
+  return status;
+}
+async function startRuntimeThenRun() {
+  await startRuntime();
+  const status = await waitForRuntimeReady();
+  if (!status.serverReachable) throw new Error('Runtime started, but no reachable game server was detected yet. Check the runtime logs and retry Start run.');
+  await submitRun();
 }
 
 function renderRuns() {
@@ -733,23 +835,11 @@ document.querySelector('#reset-bots').addEventListener('click', () => {
 });
 document.querySelector('#runtime-status').addEventListener('click', () => { void refreshRuntimeStatus(); });
 document.querySelector('#runtime-start').addEventListener('click', () => { startRuntime().catch(error => { runtimeNote.textContent = error.message; }); });
+document.querySelector('#runtime-start-run').addEventListener('click', () => { startRuntimeThenRun().catch(error => { runtimeNote.textContent = error.message; serverStatus.textContent = error.message; }); });
 document.querySelector('#runtime-stop').addEventListener('click', () => { stopRuntime().catch(error => { runtimeNote.textContent = error.message; }); });
 form.addEventListener('submit', async event => {
   event.preventDefault();
-  startButton.disabled = true;
-  serverStatus.textContent = 'starting';
-  const payload = Object.fromEntries(new FormData(form).entries());
-  payload.appendAddressSuffix = valueOf('appendAddressSuffix');
-  payload.artifactsEnabled = valueOf('artifactsEnabled');
-  payload.bots = collectBots();
-  payload.botCount = String(payload.bots.length);
-  try {
-    const response = await fetch('/api/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    const run = await response.json();
-    if (!response.ok) throw new Error(run.error || 'Run failed to start');
-    runs.unshift(run); activeRunId = run.id; attachEvents(run.id); renderRuns(); renderActive(run); serverStatus.textContent = 'running';
-  } catch (error) { serverStatus.textContent = error.message; }
-  finally { startButton.disabled = false; field('apiKey').value = ''; }
+  await submitRun();
 });
 fetch('/api/defaults').then(res => res.json()).then(data => {
   for (const [key, value] of Object.entries(data.defaults)) setValue(key, value);
