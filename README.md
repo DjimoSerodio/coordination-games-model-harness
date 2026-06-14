@@ -135,7 +135,7 @@ By default the harness appends a wallet suffix to each bot name to avoid local n
 See `.env.example` for the full set of options. Important defaults:
 
 - `GAME_SERVER=http://127.0.0.1:8787`
-- `WEB_BASE_URL=http://127.0.0.1:5173`
+- `WEB_BASE_URL=http://localhost:5173`
 - `GAME_TYPE=tragedy-of-the-commons`
 - `INSPECTOR_TOKEN=local-inspector-token`
 - `PROVIDER=scripted`

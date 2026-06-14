@@ -13,7 +13,7 @@ const MAX_ROUNDS = Number.parseInt(process.env.HARNESS_ROUNDS ?? '24', 10);
 const COMMUNICATION_SWEEPS = Number.parseInt(process.env.HARNESS_COMMUNICATION_SWEEPS ?? '1', 10);
 const PROVIDER_NAME = process.env.PROVIDER ?? 'scripted';
 const MODEL = process.env.MODEL ?? process.env.MINIMAX_MODEL ?? 'MiniMax-M2.7-highspeed';
-const WEB_BASE_URL = process.env.WEB_BASE_URL ?? 'http://127.0.0.1:5173';
+const WEB_BASE_URL = process.env.WEB_BASE_URL ?? 'http://localhost:5173';
 const INSPECTOR_TOKEN = process.env.INSPECTOR_TOKEN ?? 'local-inspector-token';
 const BOT_CONFIG_PATH = process.env.BOT_CONFIG;
 const APPEND_ADDRESS_SUFFIX = process.env.APPEND_ADDRESS_SUFFIX !== 'false';
@@ -32,7 +32,7 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
 
 Environment:
   GAME_SERVER       Coordination Games server URL (default http://127.0.0.1:8787)
-  WEB_BASE_URL      Optional web URL used only for final links (default http://127.0.0.1:5173)
+  WEB_BASE_URL      Optional web URL used only for final links (default http://localhost:5173)
   INSPECTOR_TOKEN   Admin token for /api/admin/session/:id/inspect (default local-inspector-token)
   GAME_TYPE         Game slug (default tragedy-of-the-commons)
   BOT_COUNT         Number of agents (default 4)

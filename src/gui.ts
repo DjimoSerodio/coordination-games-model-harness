@@ -288,7 +288,7 @@ function envFromConfig(raw: Record<string, unknown>, runId: string): { env: Node
     ...process.env,
     PROVIDER: provider,
     GAME_SERVER: optionalString(raw, 'gameServer', 'http://127.0.0.1:8787'),
-    WEB_BASE_URL: optionalString(raw, 'webBaseUrl', 'http://127.0.0.1:5173'),
+    WEB_BASE_URL: optionalString(raw, 'webBaseUrl', 'http://localhost:5173'),
     INSPECTOR_TOKEN: inspectorToken,
     GAME_TYPE: optionalString(raw, 'gameType', 'tragedy-of-the-commons'),
     BOT_COUNT: optionalString(raw, 'botCount', '4'),
@@ -434,7 +434,7 @@ async function sendDefaults(res: ServerResponse): Promise<void> {
     defaults: {
       provider: 'scripted',
       gameServer: 'http://127.0.0.1:8787',
-      webBaseUrl: 'http://127.0.0.1:5173',
+      webBaseUrl: 'http://localhost:5173',
       inspectorToken: 'local-inspector-token',
       gameType: 'tragedy-of-the-commons',
       botCount: '4',
