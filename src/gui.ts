@@ -1,8 +1,9 @@
 #!/usr/bin/env tsx
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
 
@@ -11,6 +12,21 @@ const HOST = process.env.HARNESS_GUI_HOST ?? '127.0.0.1';
 const ROOT = process.cwd();
 const TSX_BIN = path.join(ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
 const DEFAULT_RUNTIME_DIR = path.resolve(process.env.HARNESS_GAME_RUNTIME_DIR ?? path.resolve(ROOT, '..', 'Coordination game'));
+const LOCAL_SECRET_DIR = path.join(homedir(), '.config', 'coordination-games-model-harness');
+const LOCAL_SECRET_FILE = path.join(LOCAL_SECRET_DIR, 'secrets.json');
+const OPENCODE_GO_KEY_FILE = path.join(homedir(), '.config', 'opencode', 'opencode-go-api-key');
+const LOCAL_CONFIG_FILE = path.join(LOCAL_SECRET_DIR, 'console-config.json');
+const ALLOWED_PROVIDERS = new Set(['scripted', 'minimax', 'openai-compatible', 'opencode-go']);
+const MINIMAX_MODEL_EXAMPLES = ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2'];
+const OPENCODE_GO_MODEL_EXAMPLES = ['opencode-go/minimax-m3', 'opencode-go/minimax-m2.7', 'opencode-go/kimi-k2.7-code', 'opencode-go/kimi-k2.6', 'opencode-go/glm-5.1', 'opencode-go/glm-5', 'opencode-go/qwen3.7-max', 'opencode-go/qwen3.7-plus', 'opencode-go/qwen3.6-plus', 'opencode-go/deepseek-v4-pro', 'opencode-go/deepseek-v4-flash', 'opencode-go/mimo-v2.5-pro', 'opencode-go/mimo-v2.5'];
+const OPENAI_COMPATIBLE_MODEL_EXAMPLES = ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini'];
+
+type SecretProvider = 'minimax' | 'opencode-go' | 'openai-compatible';
+const SECRET_ENV_BY_PROVIDER: Record<SecretProvider, string> = {
+  minimax: 'MINIMAX_API_KEY',
+  'opencode-go': 'OPENCODE_GO_API_KEY',
+  'openai-compatible': 'OPENAI_API_KEY',
+};
 
 type RunStatus = 'running' | 'completed' | 'failed' | 'stopped';
 
@@ -40,6 +56,16 @@ interface BotEditorConfig {
   instruction: string;
   publicStyle: string;
   privateStyle: string;
+  provider: string;
+  model: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+  apiKey: string;
+  temperature: string;
+  topP: string;
+  maxCompletionTokens: string;
+  reasoningSplit: string;
+  reasoningEffort: string;
 }
 
 interface RuntimeRecord {
@@ -152,9 +178,174 @@ function optionalString(record: Record<string, unknown>, key: string, fallback =
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+function optionalScalarString(record: Record<string, unknown>, key: string, fallback = ''): string {
+  const value = record[key];
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'boolean') return String(value);
+  return fallback;
+}
+
 function optionalBoolean(record: Record<string, unknown>, key: string, fallback: boolean): boolean {
   const value = record[key];
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function secretProvider(value: string): SecretProvider {
+  if (value === 'minimax' || value === 'opencode-go' || value === 'openai-compatible') return value;
+  throw new Error('Choose minimax, opencode-go, or openai-compatible before saving an API key');
+}
+
+interface BotSecretEntry {
+  key: string;
+  provider?: string | undefined;
+  model?: string | undefined;
+}
+
+interface LocalSecretsFile {
+  providers: Partial<Record<SecretProvider, string>>;
+  bots: Record<string, BotSecretEntry>;
+}
+
+async function readSecretsFile(): Promise<LocalSecretsFile> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(LOCAL_SECRET_FILE, 'utf8'));
+    if (!isRecord(parsed)) return { providers: {}, bots: {} };
+    const providers: Partial<Record<SecretProvider, string>> = {};
+    for (const provider of Object.keys(SECRET_ENV_BY_PROVIDER) as SecretProvider[]) {
+      const value = parsed[provider];
+      if (typeof value === 'string' && value.trim()) providers[provider] = value.trim();
+    }
+    const bots: Record<string, BotSecretEntry> = {};
+    if (isRecord(parsed.bots)) {
+      for (const [botId, value] of Object.entries(parsed.bots)) {
+        if (typeof value === 'string' && value.trim()) {
+          bots[botId] = { key: value.trim() };
+        } else if (isRecord(value) && typeof value.key === 'string' && value.key.trim()) {
+          bots[botId] = {
+            key: value.key.trim(),
+            provider: typeof value.provider === 'string' && value.provider.trim() ? value.provider.trim() : undefined,
+            model: typeof value.model === 'string' && value.model.trim() ? value.model.trim() : undefined,
+          };
+        }
+      }
+    }
+    return { providers, bots };
+  } catch {
+    return { providers: {}, bots: {} };
+  }
+}
+
+async function readLocalSecrets(): Promise<Partial<Record<SecretProvider, string>>> {
+  return (await readSecretsFile()).providers;
+}
+
+async function readLocalBotSecrets(): Promise<Record<string, string>> {
+  return botKeyMap((await readSecretsFile()).bots);
+}
+
+function botKeyMap(bots: Record<string, BotSecretEntry>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [botId, entry] of Object.entries(bots)) out[botId] = entry.key;
+  return out;
+}
+
+function botMetaMap(bots: Record<string, BotSecretEntry>): Record<string, { provider: string; model: string }> {
+  const out: Record<string, { provider: string; model: string }> = {};
+  for (const [botId, entry] of Object.entries(bots)) out[botId] = { provider: entry.provider ?? '', model: entry.model ?? '' };
+  return out;
+}
+
+interface ConsoleConfig {
+  defaults: Record<string, string | boolean>;
+  bots: BotEditorConfig[];
+}
+
+function sanitizeConfigDefaults(raw: Record<string, unknown>): Record<string, string | boolean> {
+  const defaults: Record<string, string | boolean> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === 'apiKey' || key === 'inspectorToken') continue;
+    if (typeof value === 'string' || typeof value === 'boolean') defaults[key] = value;
+  }
+  return defaults;
+}
+
+async function readLocalConfig(): Promise<ConsoleConfig | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(LOCAL_CONFIG_FILE, 'utf8'));
+    if (!isRecord(parsed)) return null;
+    const defaults = sanitizeConfigDefaults(isRecord(parsed.defaults) ? parsed.defaults : {});
+    const bots = parseBots(parsed.bots) ?? [];
+    return { defaults, bots };
+  } catch {
+    return null;
+  }
+}
+
+async function writeLocalConfig(config: ConsoleConfig): Promise<void> {
+  await mkdir(LOCAL_SECRET_DIR, { recursive: true, mode: 0o700 });
+  const safeDefaults = sanitizeConfigDefaults(config.defaults);
+  const safeBots = config.bots.map((bot) => ({ ...bot, apiKey: '' }));
+  await writeFile(LOCAL_CONFIG_FILE, `${JSON.stringify({ defaults: safeDefaults, bots: safeBots }, null, 2)}\n`, { mode: 0o600 });
+  await chmod(LOCAL_CONFIG_FILE, 0o600);
+}
+
+async function readOpenCodeGoKeyFile(): Promise<string | undefined> {
+  try {
+    const value = (await readFile(OPENCODE_GO_KEY_FILE, 'utf8')).trim();
+    return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeSecretsFile(file: LocalSecretsFile): Promise<void> {
+  await mkdir(LOCAL_SECRET_DIR, { recursive: true, mode: 0o700 });
+  const payload: Record<string, unknown> = { ...file.providers };
+  if (Object.keys(file.bots).length > 0) payload.bots = file.bots;
+  await writeFile(LOCAL_SECRET_FILE, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await chmod(LOCAL_SECRET_FILE, 0o600);
+}
+
+async function writeLocalSecrets(secrets: Partial<Record<SecretProvider, string>>): Promise<void> {
+  const file = await readSecretsFile();
+  await writeSecretsFile({ providers: secrets, bots: file.bots });
+}
+
+async function saveLocalBotSecrets(botEntries: Record<string, BotSecretEntry>): Promise<void> {
+  const trimmed: Record<string, BotSecretEntry> = {};
+  for (const [botId, entry] of Object.entries(botEntries)) {
+    if (botId.trim() && entry.key.trim()) {
+      trimmed[botId.trim()] = {
+        key: entry.key.trim(),
+        provider: entry.provider?.trim() || undefined,
+        model: entry.model?.trim() || undefined,
+      };
+    }
+  }
+  if (Object.keys(trimmed).length === 0) return;
+  const file = await readSecretsFile();
+  await writeSecretsFile({ providers: file.providers, bots: { ...file.bots, ...trimmed } });
+}
+
+async function saveLocalSecret(provider: SecretProvider, apiKey: string): Promise<void> {
+  const trimmed = apiKey.trim();
+  if (!trimmed) throw new Error('API key is required to save locally');
+  await writeLocalSecrets({ ...(await readLocalSecrets()), [provider]: trimmed });
+}
+
+async function deleteLocalSecret(provider: SecretProvider): Promise<void> {
+  const secrets = await readLocalSecrets();
+  delete secrets[provider];
+  await writeLocalSecrets(secrets);
+}
+
+async function localSecretStatus(secrets: Partial<Record<SecretProvider, string>>): Promise<Record<SecretProvider, boolean>> {
+  return {
+    minimax: Boolean(secrets.minimax),
+    'opencode-go': Boolean(secrets['opencode-go'] || (await readOpenCodeGoKeyFile())),
+    'openai-compatible': Boolean(secrets['openai-compatible']),
+  };
 }
 
 function assertSafeRelativePath(value: string, label: string): string {
@@ -204,15 +395,168 @@ function parseBots(raw: unknown): BotEditorConfig[] | null {
     instruction: optionalString(bot, 'instruction', 'Play the game according to your persona.'),
     publicStyle: optionalString(bot, 'publicStyle', 'I am ready to coordinate.'),
     privateStyle: optionalString(bot, 'privateStyle', 'I am looking for reliable partners.'),
+    provider: optionalString(bot, 'provider'),
+    model: optionalString(bot, 'model'),
+    baseUrl: optionalString(bot, 'baseUrl', optionalString(bot, 'openAiBaseUrl')),
+    apiKeyEnv: optionalString(bot, 'apiKeyEnv'),
+    apiKey: optionalString(bot, 'apiKey'),
+    temperature: optionalScalarString(bot, 'temperature'),
+    topP: optionalScalarString(bot, 'topP'),
+    maxCompletionTokens: optionalScalarString(bot, 'maxCompletionTokens'),
+    reasoningSplit: optionalScalarString(bot, 'reasoningSplit'),
+    reasoningEffort: optionalString(bot, 'reasoningEffort'),
   }));
   return bots.length > 0 ? bots : null;
+}
+
+function botConfigForFile(bot: BotEditorConfig, index: number): Record<string, string> {
+  const { apiKey, ...safeBot } = bot;
+  const rawKey = apiKey.trim();
+  if (!rawKey) return safeBot;
+  return { ...safeBot, apiKeyEnv: `HARNESS_BOT_${index + 1}_API_KEY` };
+}
+
+function envForBotApiKeys(bots: BotEditorConfig[]): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  bots.forEach((bot, index) => {
+    const rawKey = bot.apiKey.trim();
+    if (rawKey) env[`HARNESS_BOT_${index + 1}_API_KEY`] = rawKey;
+  });
+  return env;
+}
+
+async function hydrateAndPersistBotKeys(bots: BotEditorConfig[]): Promise<void> {
+  const saved = await readLocalBotSecrets();
+  const toPersist: Record<string, BotSecretEntry> = {};
+  for (const bot of bots) {
+    const botId = bot.id.trim();
+    const rawKey = bot.apiKey.trim();
+    if (rawKey) {
+      if (botId) toPersist[botId] = { key: rawKey, provider: bot.provider?.trim() || undefined, model: bot.model?.trim() || undefined };
+    } else if (botId && saved[botId]) {
+      bot.apiKey = saved[botId];
+    }
+  }
+  await saveLocalBotSecrets(toPersist);
+}
+
+async function persistGlobalKeyFromRun(raw: Record<string, unknown>): Promise<void> {
+  const provider = optionalString(raw, 'provider', 'scripted');
+  const apiKey = optionalString(raw, 'apiKey');
+  if (!apiKey || provider === 'scripted' || !ALLOWED_PROVIDERS.has(provider)) return;
+  await saveLocalSecret(secretProvider(provider), apiKey);
+}
+
+function defaultBaseUrlForProvider(provider: string): string {
+  if (provider === 'opencode-go') return 'http://127.0.0.1:4096';
+  return 'https://api.minimax.io/v1';
+}
+
+function validateMiniMaxModel(model: string, label: string): void {
+  if (!model) return;
+  if (/^m\d+(?:\b|[-_.])/i.test(model)) {
+    throw new Error(`${label} uses MiniMax model "${model}", but MiniMax expects exact model IDs, not shorthand. Try ${MINIMAX_MODEL_EXAMPLES.join(' or ')}.`);
+  }
+  if (model.startsWith('opencode-go/')) {
+    throw new Error(`${label} is configured as MiniMax but has OpenCode Go model "${model}". Choose provider opencode-go or pick a MiniMax model such as MiniMax-M2.7-highspeed.`);
+  }
+}
+
+function defaultModelForProvider(provider: string, globalProvider: string, globalModel: string): string {
+  if (provider === globalProvider) return globalModel;
+  if (provider === 'minimax') return 'MiniMax-M2.7-highspeed';
+  if (provider === 'opencode-go') return 'opencode-go/minimax-m3';
+  if (provider === 'openai-compatible') return 'gpt-4.1';
+  return globalModel;
+}
+
+function validateRunRounds(raw: Record<string, unknown>, bots: BotEditorConfig[]): void {
+  if (optionalBoolean(raw, 'allowZeroRounds', false)) return;
+  if (!runUsesModelProvider(raw, bots)) return;
+  const rounds = Number.parseInt(optionalString(raw, 'rounds', '12'), 10);
+  if (!Number.isFinite(rounds) || rounds < 1) {
+    throw new Error('Rounds is set to 0, so the harness will only create a lobby/game and make zero model calls. Set Rounds to at least 1 for an actual model test.');
+  }
+}
+
+function validateBotProviderSecrets(raw: Record<string, unknown>, bots: BotEditorConfig[]): void {
+  const globalProvider = optionalString(raw, 'provider', 'scripted');
+  if (!ALLOWED_PROVIDERS.has(globalProvider)) throw new Error(`Unknown provider: ${globalProvider}`);
+  const globalModel = optionalString(raw, 'model', 'MiniMax-M2.7-highspeed');
+  if (globalProvider === 'minimax') validateMiniMaxModel(globalModel, 'Global provider');
+  if (optionalString(raw, 'apiKey') && globalProvider === 'scripted') {
+    throw new Error('Global API key was provided, but the global provider is scripted. Choose minimax, opencode-go, or openai-compatible, or remove the global API key.');
+  }
+  const scriptedBots: string[] = [];
+  bots.forEach((bot, index) => {
+    if (bot.provider && !ALLOWED_PROVIDERS.has(bot.provider)) throw new Error(`Bot ${index + 1} (${bot.name}) has unknown provider: ${bot.provider}`);
+    const effectiveProvider = bot.provider || globalProvider;
+    const effectiveModel = bot.model || defaultModelForProvider(effectiveProvider, globalProvider, globalModel);
+    if (effectiveProvider === 'minimax') validateMiniMaxModel(effectiveModel, `Bot ${index + 1} (${bot.name})`);
+    if (effectiveProvider === 'scripted') scriptedBots.push(`Bot ${index + 1} (${bot.name})`);
+    const hasBotSecret = Boolean(bot.apiKey.trim() || bot.apiKeyEnv.trim());
+    if (hasBotSecret && effectiveProvider === 'scripted') {
+      throw new Error(`Bot ${index + 1} (${bot.name}) has an API key, but its provider is scripted. Choose minimax, opencode-go, or openai-compatible for that bot.`);
+    }
+  });
+  if (scriptedBots.length > 0) {
+    throw new Error(`This GUI run still has scripted bots: ${scriptedBots.join(', ')}. Scripted is only a plumbing smoke and cannot follow runtime tools that require arguments. Set the global provider/API key so all bots inherit a model provider, or set provider/model/API key on every bot.`);
+  }
+  validateRunRounds(raw, bots);
+}
+
+function runUsesOpenCodeGo(raw: Record<string, unknown>, bots: BotEditorConfig[]): boolean {
+  const globalProvider = optionalString(raw, 'provider', 'scripted');
+  return globalProvider === 'opencode-go' || bots.some((bot) => (bot.provider || globalProvider) === 'opencode-go');
+}
+
+function runUsesModelProvider(raw: Record<string, unknown>, bots: BotEditorConfig[]): boolean {
+  const globalProvider = optionalString(raw, 'provider', 'scripted');
+  return globalProvider !== 'scripted' || bots.some((bot) => (bot.provider || globalProvider) !== 'scripted');
+}
+
+function openCodeAuthHeaders(env: NodeJS.ProcessEnv): Record<string, string> {
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  const password = env.OPENCODE_SERVER_PASSWORD;
+  if (password) {
+    const username = env.OPENCODE_SERVER_USERNAME?.trim() || 'opencode';
+    headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+  }
+  return headers;
+}
+
+async function assertOpenCodeServerReady(env: NodeJS.ProcessEnv): Promise<void> {
+  const baseUrl = (env.OPENCODE_GO_BASE_URL || 'http://127.0.0.1:4096').replace(/\/$/, '');
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error(`Invalid OPENCODE_GO_BASE_URL for OpenCode Go: ${baseUrl}`);
+  }
+  if (!isLoopbackHost(parsed.hostname)) {
+    throw new Error(`OpenCode Go GUI runs are limited to a loopback opencode serve URL, got ${parsed.hostname}`);
+  }
+  const response = await fetch(`${baseUrl}/session`, {
+    method: 'POST',
+    headers: { ...openCodeAuthHeaders(env), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: `Coordination Games Harness GUI preflight ${Date.now()}` }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (response.status === 401) {
+    throw new Error('OpenCode Go local server rejected GUI auth (HTTP 401). Restart the harness console with OPENCODE_SERVER_USERNAME=opencode and OPENCODE_SERVER_PASSWORD set to the password for `opencode serve`, then retry. The OpenCode Go API key field is not the same as local server Basic auth.');
+  }
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`OpenCode Go local server preflight failed: HTTP ${response.status}: ${body.slice(0, 300)}`);
+  }
+  await response.arrayBuffer();
 }
 
 async function writeGeneratedBotConfig(runId: string, bots: BotEditorConfig[]): Promise<string> {
   const dir = path.join(ROOT, 'runs', 'gui-configs');
   await mkdir(dir, { recursive: true });
   const relativePath = path.join('runs', 'gui-configs', `${runId}.bots.json`);
-  await writeFile(path.join(ROOT, relativePath), `${JSON.stringify({ bots }, null, 2)}\n`);
+  await writeFile(path.join(ROOT, relativePath), `${JSON.stringify({ bots: bots.map(botConfigForFile) }, null, 2)}\n`);
   return relativePath;
 }
 
@@ -335,9 +679,9 @@ function stopRuntime(): Record<string, unknown> {
   };
 }
 
-function envFromConfig(raw: Record<string, unknown>, runId: string): { env: NodeJS.ProcessEnv; publicConfig: Record<string, string | boolean> } {
+async function envFromConfig(raw: Record<string, unknown>, runId: string): Promise<{ env: NodeJS.ProcessEnv; publicConfig: Record<string, string | boolean> }> {
   const provider = optionalString(raw, 'provider', 'scripted');
-  if (!['scripted', 'openai-compatible', 'minimax'].includes(provider)) {
+  if (!['scripted', 'openai-compatible', 'minimax', 'opencode-go'].includes(provider)) {
     throw new Error(`Unsupported provider: ${provider}`);
   }
 
@@ -345,6 +689,15 @@ function envFromConfig(raw: Record<string, unknown>, runId: string): { env: Node
   const resultsDir = assertSafeRelativePath(optionalString(raw, 'resultsDir', 'runs/model-harness'), 'HARNESS_RESULTS_DIR');
   const apiKey = optionalString(raw, 'apiKey');
   const inspectorToken = optionalString(raw, 'inspectorToken', 'local-inspector-token');
+  const savedSecrets = await readLocalSecrets();
+  const opencodeGoKeyFile = await readOpenCodeGoKeyFile();
+  const submittedBaseUrl = optionalString(raw, 'openAiBaseUrl');
+  const effectiveBaseUrl =
+    provider === 'opencode-go' &&
+    (!submittedBaseUrl || submittedBaseUrl === 'https://api.minimax.io/v1' || submittedBaseUrl === 'https://api.opencode.ai/v1')
+      ? defaultBaseUrlForProvider(provider)
+      : submittedBaseUrl || defaultBaseUrlForProvider(provider);
+  const opencodeGoBaseUrl = provider === 'opencode-go' ? effectiveBaseUrl : 'http://127.0.0.1:4096';
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -367,13 +720,27 @@ function envFromConfig(raw: Record<string, unknown>, runId: string): { env: Node
     HARNESS_COMPLETION_USD_PER_1M: optionalString(raw, 'completionUsdPer1M', '0'),
     BOT_CONFIG: botConfig,
     APPEND_ADDRESS_SUFFIX: optionalBoolean(raw, 'appendAddressSuffix', true) ? 'true' : 'false',
-    OPENAI_BASE_URL: optionalString(raw, 'openAiBaseUrl', 'https://api.minimax.io/v1'),
+    OPENAI_BASE_URL: effectiveBaseUrl,
+    OPENCODE_GO_BASE_URL: opencodeGoBaseUrl,
+    OPENCODE_SERVER_USERNAME: process.env.OPENCODE_SERVER_USERNAME?.trim() || 'opencode',
     MODEL: optionalString(raw, 'model', 'MiniMax-M2.7-highspeed'),
+    MODEL_TEMPERATURE: optionalString(raw, 'modelTemperature', '1'),
+    MODEL_TOP_P: optionalString(raw, 'modelTopP', '0.95'),
+    MODEL_MAX_COMPLETION_TOKENS: optionalString(raw, 'modelMaxCompletionTokens', '1024'),
+    MODEL_REASONING_SPLIT: optionalBoolean(raw, 'modelReasoningSplit', true) ? 'true' : 'false',
+    MODEL_REASONING_EFFORT: optionalString(raw, 'modelReasoningEffort'),
   };
+
+  for (const savedProvider of Object.keys(SECRET_ENV_BY_PROVIDER) as SecretProvider[]) {
+    const envName = SECRET_ENV_BY_PROVIDER[savedProvider];
+    if (savedSecrets[savedProvider] && !env[envName]) env[envName] = savedSecrets[savedProvider];
+  }
+  if (opencodeGoKeyFile && !env.OPENCODE_GO_API_KEY) env.OPENCODE_GO_API_KEY = opencodeGoKeyFile;
 
   if (apiKey) {
     if (provider === 'minimax') env.MINIMAX_API_KEY = apiKey;
     if (provider === 'openai-compatible') env.OPENAI_API_KEY = apiKey;
+    if (provider === 'opencode-go') env.OPENCODE_GO_API_KEY = apiKey;
   }
 
   const publicConfig: Record<string, string | boolean> = {
@@ -396,7 +763,12 @@ function envFromConfig(raw: Record<string, unknown>, runId: string): { env: Node
     appendAddressSuffix: env.APPEND_ADDRESS_SUFFIX !== 'false',
     openAiBaseUrl: env.OPENAI_BASE_URL ?? '',
     model: env.MODEL ?? '',
-    apiKeyProvided: Boolean(apiKey),
+    modelTemperature: env.MODEL_TEMPERATURE ?? '',
+    modelTopP: env.MODEL_TOP_P ?? '',
+    modelMaxCompletionTokens: env.MODEL_MAX_COMPLETION_TOKENS ?? '',
+    modelReasoningSplit: env.MODEL_REASONING_SPLIT !== 'false',
+    modelReasoningEffort: env.MODEL_REASONING_EFFORT ?? '',
+    apiKeyProvided: Boolean(apiKey || (provider !== 'scripted' && env[SECRET_ENV_BY_PROVIDER[secretProvider(provider)]])),
     inspectorTokenProvided: Boolean(inspectorToken),
   };
 
@@ -431,13 +803,19 @@ async function startRun(raw: unknown): Promise<RunRecord> {
   const runId = sanitizeRunId(requestedId);
   if (runs.has(runId)) throw new Error(`Run already exists: ${runId}`);
   const bots = parseBots(raw.bots);
+  if (bots) await hydrateAndPersistBotKeys(bots);
+  await persistGlobalKeyFromRun(raw);
+  validateBotProviderSecrets(raw, bots ?? []);
+  try { await writeLocalConfig({ defaults: sanitizeConfigDefaults(raw), bots: bots ?? [] }); } catch { /* config persistence is best-effort */ }
   const effectiveRaw: Record<string, unknown> = { ...raw };
   if (bots) {
     effectiveRaw.botConfig = await writeGeneratedBotConfig(runId, bots);
     effectiveRaw.botCount = String(bots.length);
   }
-  const { env, publicConfig } = envFromConfig(effectiveRaw, runId);
+  const { env, publicConfig } = await envFromConfig(effectiveRaw, runId);
+  if (bots) Object.assign(env, envForBotApiKeys(bots));
   if (bots) publicConfig.inlineBots = String(bots.length);
+  if (runUsesOpenCodeGo(effectiveRaw, bots ?? [])) await assertOpenCodeServerReady(env);
   const artifactDir = path.join(env.HARNESS_RESULTS_DIR ?? 'runs/model-harness', runId);
   const child = spawn(TSX_BIN, ['src/index.ts'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const run: RunRecord = {
@@ -486,36 +864,66 @@ async function stopRun(id: string): Promise<RunRecord> {
 }
 
 async function sendDefaults(res: ServerResponse): Promise<void> {
+  const secretsFile = await readSecretsFile();
+  const localSecrets = await localSecretStatus(secretsFile.providers);
+  const localBotSecrets = Object.keys(secretsFile.bots);
+  const savedConfig = await readLocalConfig();
+  const botMeta = botMetaMap(secretsFile.bots);
+  const baseDefaults: Record<string, string | boolean> = {
+    provider: 'scripted',
+    gameServer: 'http://127.0.0.1:8787',
+    webBaseUrl: 'http://localhost:5173',
+    inspectorToken: 'local-inspector-token',
+    gameType: 'tragedy-of-the-commons',
+    botCount: '4',
+    teamSize: '2',
+    rounds: '12',
+    communicationSweeps: '1',
+    modelTimeoutMs: '90000',
+    modelRetries: '1',
+    artifactsEnabled: true,
+    resultsDir: 'runs/model-harness',
+    maxCostUsd: '0',
+    promptUsdPer1M: '0',
+    completionUsdPer1M: '0',
+    botConfig: 'examples/tragedy-bots.example.json',
+    appendAddressSuffix: true,
+    openAiBaseUrl: 'https://api.minimax.io/v1',
+    model: 'MiniMax-M2.7-highspeed',
+    modelTemperature: '1',
+    modelTopP: '0.95',
+    modelMaxCompletionTokens: '1024',
+    modelReasoningSplit: true,
+    modelReasoningEffort: '',
+  };
+  const defaults = { ...baseDefaults, ...(savedConfig?.defaults ?? {}) };
+  const sourceBots = savedConfig?.bots && savedConfig.bots.length > 0 ? savedConfig.bots : await loadDefaultBots();
+  const bots = sourceBots.map((bot) => {
+    const meta = botMeta[bot.id];
+    if (meta && meta.provider && !bot.provider) {
+      return { ...bot, provider: meta.provider, model: bot.model || meta.model };
+    }
+    return bot;
+  });
   sendJson(res, 200, {
     botConfigs: await botConfigOptions(),
-    bots: await loadDefaultBots(),
+    bots,
     runtime: {
       runtimeDir: DEFAULT_RUNTIME_DIR,
       runtimeCommand: 'npm run dev',
     },
-    defaults: {
-      provider: 'scripted',
-      gameServer: 'http://127.0.0.1:8787',
-      webBaseUrl: 'http://localhost:5173',
-      inspectorToken: 'local-inspector-token',
-      gameType: 'tragedy-of-the-commons',
-      botCount: '4',
-      teamSize: '2',
-      rounds: '12',
-      communicationSweeps: '1',
-      modelTimeoutMs: '90000',
-      modelRetries: '1',
-      artifactsEnabled: true,
-      resultsDir: 'runs/model-harness',
-      maxCostUsd: '0',
-      promptUsdPer1M: '0',
-      completionUsdPer1M: '0',
-      botConfig: 'examples/tragedy-bots.example.json',
-      appendAddressSuffix: true,
-      openAiBaseUrl: 'https://api.minimax.io/v1',
-      model: 'MiniMax-M2.7-highspeed',
-    },
+    defaults,
+    localSecrets,
+    localBotSecrets,
+    savedKeys: secretsFile.providers,
+    savedBotKeys: botKeyMap(secretsFile.bots),
+    savedBotMeta: botMeta,
   });
+}
+
+async function sendSecretStatus(res: ServerResponse): Promise<void> {
+  const secretsFile = await readSecretsFile();
+  sendJson(res, 200, { localSecrets: await localSecretStatus(secretsFile.providers), localBotSecrets: Object.keys(secretsFile.bots), savedKeys: secretsFile.providers, savedBotKeys: botKeyMap(secretsFile.bots), savedBotMeta: botMetaMap(secretsFile.bots) });
 }
 
 function attachEvents(res: ServerResponse, run: RunRecord): void {
@@ -539,6 +947,46 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
     if (req.method === 'GET' && url.pathname === '/api/defaults') {
       await sendDefaults(res);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/secrets/status') {
+      await sendSecretStatus(res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/secrets') {
+      const body = await readBody(req);
+      if (!isRecord(body)) throw new Error('Secret payload must be an object');
+      const provider = secretProvider(optionalString(body, 'provider'));
+      await saveLocalSecret(provider, optionalString(body, 'apiKey'));
+      await sendSecretStatus(res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/secrets/bot') {
+      const body = await readBody(req);
+      if (!isRecord(body)) throw new Error('Bot secret payload must be an object');
+      const botId = optionalString(body, 'botId');
+      const apiKey = optionalString(body, 'apiKey');
+      const botProvider = optionalString(body, 'provider');
+      const botModel = optionalString(body, 'model');
+      if (!botId) throw new Error('botId is required to save a bot key');
+      if (!apiKey) throw new Error('apiKey is required to save a bot key');
+      await saveLocalBotSecrets({ [botId]: { key: apiKey, provider: botProvider || undefined, model: botModel || undefined } });
+      await sendSecretStatus(res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/config') {
+      const body = await readBody(req);
+      if (!isRecord(body)) throw new Error('Config payload must be an object');
+      const defaults = sanitizeConfigDefaults(isRecord(body.defaults) ? body.defaults : {});
+      const bots = parseBots(body.bots) ?? [];
+      await writeLocalConfig({ defaults, bots });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    const secretDeleteMatch = url.pathname.match(/^\/api\/secrets\/([^/]+)$/);
+    if (req.method === 'DELETE' && secretDeleteMatch?.[1]) {
+      await deleteLocalSecret(secretProvider(secretDeleteMatch[1]));
+      await sendSecretStatus(res);
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/runtime/status') {
@@ -653,18 +1101,30 @@ function htmlPage(): string {
           <label>Run ID <input name="runId" placeholder="gui-smoke-run" /></label>
           <div class="row"><label>Game server <input name="gameServer" /></label><label>Web URL <input name="webBaseUrl" /></label></div>
           <div class="row"><label>Game type <input name="gameType" /></label><label>Bot config <select name="botConfig"></select></label></div>
-          <div class="row"><label>Rounds <input name="rounds" inputmode="numeric" /></label><label>Communication sweeps <input name="communicationSweeps" inputmode="numeric" /></label></div>
+          <div class="row"><label>Max gameplay rounds after setup <input name="rounds" inputmode="numeric" /></label><label>Communication sweeps <input name="communicationSweeps" inputmode="numeric" /></label></div>
           <label class="check"><input type="checkbox" name="appendAddressSuffix" /> Append wallet suffix to bot names</label>
         </div>
         <div class="fieldset"><h2>Bots + personas</h2>
           <p class="note">Edit each bot directly here. On run start, the GUI writes an ignored per-run bot config under <code>runs/gui-configs/</code> and passes it to the harness.</p>
+          <p class="note">For mixed-model runs, set provider/model/API key on each bot. If a bot has an API key, its provider must be minimax, opencode-go, or openai-compatible; scripted ignores model APIs.</p>
+          <p class="note">Per-bot API keys are saved locally on this machine (~/.config/coordination-games-model-harness/secrets.json, owner-only) so they persist across page refreshes and GUI restarts. They are never written to bot config files, run metadata, or artifacts. Leave a saved bot's key blank to reuse it.</p>
           <div id="bot-editor" style="display:grid;gap:12px"></div>
           <div class="runtime-line"><button class="secondary" id="add-bot" type="button">Add bot</button><button class="secondary" id="reset-bots" type="button">Reset example bots</button></div>
         </div>
         <div class="fieldset"><h2>Provider</h2>
-          <div class="row"><label>Provider <select name="provider"><option value="scripted">scripted</option><option value="minimax">minimax</option><option value="openai-compatible">openai-compatible</option></select></label><label>Model <input name="model" /></label></div>
+          <div class="row"><label>Provider <select name="provider"><option value="scripted">scripted</option><option value="minimax">minimax</option><option value="opencode-go">opencode-go</option><option value="openai-compatible">openai-compatible</option></select></label><label>Model <input name="model" list="models-minimax" /></label></div>
+          <datalist id="models-minimax">${MINIMAX_MODEL_EXAMPLES.map((model) => `<option value="${model}"></option>`).join('')}</datalist>
+          <datalist id="models-opencode-go">${OPENCODE_GO_MODEL_EXAMPLES.map((model) => `<option value="${model}"></option>`).join('')}</datalist>
+          <datalist id="models-openai-compatible">${OPENAI_COMPATIBLE_MODEL_EXAMPLES.map((model) => `<option value="${model}"></option>`).join('')}</datalist>
+          <p class="note">MiniMax model names must be exact IDs. Do not use shorthand like <code>M3</code>. OpenCode Go models use IDs like <code>opencode-go/minimax-m3</code>.</p>
           <label>OpenAI-compatible base URL <input name="openAiBaseUrl" /></label>
-          <label>API key <input name="apiKey" type="password" autocomplete="off" placeholder="not stored; passed only to child process" /></label>
+          <div class="row"><label>Temperature <input name="modelTemperature" /></label><label>Top P <input name="modelTopP" /></label></div>
+          <div class="row"><label>Max tokens <input name="modelMaxCompletionTokens" inputmode="numeric" /></label><label>Reasoning effort <input name="modelReasoningEffort" placeholder="provider-specific" /></label></div>
+          <label class="check"><input type="checkbox" name="modelReasoningSplit" /> Request reasoning split when provider supports it</label>
+          <label>API key <input name="apiKey" type="password" autocomplete="off" placeholder="blank uses saved local key when available" /></label>
+          <div class="runtime-line"><button class="secondary" id="save-api-key" type="button">Save key locally</button><button class="secondary" id="clear-api-key" type="button">Clear saved key</button></div>
+          <label>Pull from saved keys <select id="saved-key-picker"><option value="">— saved keys —</option></select></label>
+          <p class="note" id="api-key-note">Saved key status not checked yet.</p>
           <label>Inspector token <input name="inspectorToken" type="password" autocomplete="off" /></label>
         </div>
         <div class="fieldset"><h2>Safety + artifacts</h2>
@@ -675,7 +1135,7 @@ function htmlPage(): string {
           <label class="check"><input type="checkbox" name="artifactsEnabled" /> Write artifacts</label>
         </div>
         <button id="start-button" type="submit">Start run — creates lobby/game</button>
-        <p class="note">Secrets are never stored in GUI state or run metadata. They are passed to the harness subprocess only for the selected run.</p>
+        <p class="note">Secrets are never written to generated config files, run metadata, or artifacts. They are passed to the harness subprocess only for the selected run.</p>
       </form>
     </section>
     <section class="runs">
@@ -693,9 +1153,15 @@ const serverStatus = document.querySelector('#server-status');
 const startButton = document.querySelector('#start-button');
 const botEditor = document.querySelector('#bot-editor');
 const runtimeNote = document.querySelector('#runtime-note');
+const apiKeyNote = document.querySelector('#api-key-note');
 let runs = [];
 let defaultBots = [];
 let bots = [];
+let localSecrets = {};
+let localBotSecrets = [];
+let savedKeys = {};
+let savedBotKeys = {};
+let savedBotMeta = {};
 let activeRunId = null;
 let source = null;
 
@@ -704,18 +1170,159 @@ function setValue(name, value) { const el = field(name); if (!el) return; if (el
 function valueOf(name) { const el = field(name); if (!el) return ''; return el.type === 'checkbox' ? el.checked : el.value; }
 function lineClass(stream) { return stream === 'stderr' ? 'stderr' : stream === 'system' ? 'system' : 'stdout'; }
 function escapeHtml(text) { return String(text).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch])); }
+function modelListForProvider(provider) { return provider === 'minimax' ? 'models-minimax' : provider === 'opencode-go' ? 'models-opencode-go' : provider === 'openai-compatible' ? 'models-openai-compatible' : ''; }
+function modelPlaceholderForProvider(provider) { return provider === 'minimax' ? 'MiniMax-M3' : provider === 'opencode-go' ? 'opencode-go/minimax-m3' : provider === 'openai-compatible' ? 'custom model id, e.g. gpt-4.1' : 'ignored for scripted'; }
+function defaultModelForProvider(provider) { return provider === 'opencode-go' ? 'opencode-go/minimax-m3' : provider === 'minimax' ? 'MiniMax-M3' : valueOf('model'); }
+function defaultBaseUrlForProvider(provider) { return provider === 'opencode-go' ? 'http://127.0.0.1:4096' : provider === 'minimax' ? 'https://api.minimax.io/v1' : valueOf('openAiBaseUrl'); }
+function knownProviderModels() { return ['MiniMax-M3', 'MiniMax-M2.7-highspeed', 'opencode-go/minimax-m3', 'opencode-go/minimax-m2.7']; }
+function applyProviderDefaults() {
+  const provider = valueOf('provider');
+  const model = valueOf('model');
+  if (!model || knownProviderModels().includes(model)) setValue('model', defaultModelForProvider(provider));
+  const baseUrl = valueOf('openAiBaseUrl');
+  if (!baseUrl || baseUrl === 'https://api.minimax.io/v1' || baseUrl === 'https://api.opencode.ai/v1' || baseUrl === 'http://127.0.0.1:4096') setValue('openAiBaseUrl', defaultBaseUrlForProvider(provider));
+}
+function keyProvider(provider) { return provider === 'minimax' || provider === 'opencode-go' || provider === 'openai-compatible' ? provider : ''; }
+function refreshApiKeyNote() {
+  const provider = keyProvider(valueOf('provider'));
+  if (!provider) {
+    apiKeyNote.textContent = 'Scripted does not use API keys.';
+    return;
+  }
+  if (provider === 'opencode-go') {
+    apiKeyNote.textContent = localSecrets[provider]
+      ? 'OpenCode Go key detected locally. Runs use the local OpenCode server at the base URL; if that server requires Basic auth, start the GUI with OPENCODE_SERVER_PASSWORD available.'
+      : 'OpenCode Go runs use the local OpenCode server. Configure your subscription in OpenCode (for example ~/.config/opencode/opencode-go-api-key), then leave this field blank.';
+    return;
+  }
+  apiKeyNote.textContent = localSecrets[provider]
+    ? 'Saved local key available for ' + provider + '. Leave API key blank to reuse it.'
+    : 'No saved local key for ' + provider + '. Paste a key once and click Save key locally.';
+}
+function maskKey(k){ return !k ? '' : (k.length <= 4 ? '••••' : '••••' + k.slice(-4)); }
+function rebuildKeyPicker(){
+  const picker = document.querySelector('#saved-key-picker');
+  if (!picker) return;
+  const opts = ['<option value="">— pull from a saved key —</option>'];
+  for (const [prov, val] of Object.entries(savedKeys)) { if (val) opts.push('<option value="provider:' + escapeHtml(prov) + '">' + escapeHtml(prov + ' · ' + maskKey(val)) + '</option>'); }
+  for (const [botId, val] of Object.entries(savedBotKeys)) { if (val) { const m = savedBotMeta[botId] || {}; const label = (m.provider || 'unknown provider') + (m.model ? ' / ' + m.model : '') + ' · bot ' + botId + ' · ' + maskKey(val); opts.push('<option value="bot:' + escapeHtml(botId) + '">' + escapeHtml(label) + '</option>'); } }
+  picker.innerHTML = opts.join('');
+}
+function populateKeyFields(){
+  const prov = keyProvider(valueOf('provider'));
+  setValue('apiKey', prov && savedKeys[prov] ? savedKeys[prov] : '');
+  botEditor.querySelectorAll('.bot-card').forEach(card => {
+    const idEl = card.querySelector('[data-bot-field="id"]');
+    const keyEl = card.querySelector('[data-bot-field="apiKey"]');
+    if (idEl && keyEl) { const k = savedBotKeys[idEl.value.trim()]; keyEl.value = k || ''; }
+  });
+}
+function populateSavedKeys(){ rebuildKeyPicker(); populateKeyFields(); }
+const CONFIG_FIELDS = ['provider','model','openAiBaseUrl','gameServer','webBaseUrl','gameType','botCount','teamSize','rounds','communicationSweeps','modelTimeoutMs','modelRetries','artifactsEnabled','resultsDir','maxCostUsd','promptUsdPer1M','completionUsdPer1M','botConfig','appendAddressSuffix','modelTemperature','modelTopP','modelMaxCompletionTokens','modelReasoningSplit','modelReasoningEffort'];
+function consoleConfigPayload(){
+  const defaults = {};
+  for (const name of CONFIG_FIELDS) { if (field(name)) defaults[name] = valueOf(name); }
+  const bots = collectBots().map(bot => Object.assign({}, bot, { apiKey: '' }));
+  return { defaults, bots };
+}
+let configSaveTimer = null;
+function scheduleConfigSave(){
+  if (configSaveTimer) clearTimeout(configSaveTimer);
+  configSaveTimer = setTimeout(() => { fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(consoleConfigPayload()) }).catch(() => {}); }, 400);
+}
+async function loadSecretStatus() {
+  const response = await fetch('/api/secrets/status');
+  const data = await response.json();
+  localSecrets = data.localSecrets || {};
+  localBotSecrets = data.localBotSecrets || localBotSecrets;
+  savedKeys = data.savedKeys || {};
+  savedBotKeys = data.savedBotKeys || {};
+  savedBotMeta = data.savedBotMeta || {};
+  rebuildKeyPicker();
+  refreshApiKeyNote();
+}
+async function saveApiKey() {
+  const provider = keyProvider(valueOf('provider'));
+  if (!provider) throw new Error('Choose minimax, opencode-go, or openai-compatible before saving a key.');
+  const apiKey = valueOf('apiKey');
+  if (!apiKey) throw new Error('Paste an API key before saving.');
+  const response = await fetch('/api/secrets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, apiKey }) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to save API key');
+  localSecrets = data.localSecrets || {};
+  savedKeys = data.savedKeys || savedKeys;
+  savedBotKeys = data.savedBotKeys || savedBotKeys;
+  savedBotMeta = data.savedBotMeta || savedBotMeta;
+  rebuildKeyPicker();
+  refreshApiKeyNote();
+}
+async function clearApiKey() {
+  const provider = keyProvider(valueOf('provider'));
+  if (!provider) throw new Error('Choose minimax, opencode-go, or openai-compatible before clearing a key.');
+  const response = await fetch('/api/secrets/' + encodeURIComponent(provider), { method: 'DELETE' });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to clear API key');
+  localSecrets = data.localSecrets || {};
+  savedKeys = data.savedKeys || {};
+  savedBotKeys = data.savedBotKeys || savedBotKeys;
+  savedBotMeta = data.savedBotMeta || savedBotMeta;
+  setValue('apiKey', '');
+  rebuildKeyPicker();
+  refreshApiKeyNote();
+}
+function refreshModelSuggestions() {
+  const globalProvider = valueOf('provider') || 'scripted';
+  const globalModel = field('model');
+  if (globalModel) {
+    const listId = modelListForProvider(globalProvider);
+    if (listId) globalModel.setAttribute('list', listId); else globalModel.removeAttribute('list');
+    globalModel.placeholder = modelPlaceholderForProvider(globalProvider);
+  }
+  refreshApiKeyNote();
+  botEditor.querySelectorAll('.bot-card').forEach(card => {
+    const provider = card.querySelector('[data-bot-field="provider"]').value || globalProvider;
+    const model = card.querySelector('[data-bot-field="model"]');
+    const listId = modelListForProvider(provider);
+    if (listId) model.setAttribute('list', listId); else model.removeAttribute('list');
+    model.placeholder = provider === globalProvider ? 'inherit global' : modelPlaceholderForProvider(provider);
+  });
+}
 
-function blankBot(index) { return { name: 'Harness Bot ' + (index + 1), id: 'bot-' + (index + 1), title: 'Custom persona', instruction: 'Play the game according to your persona.', publicStyle: 'I am ready to coordinate.', privateStyle: 'I am looking for reliable partners.' }; }
+function blankBot(index) { return { name: 'Harness Bot ' + (index + 1), id: 'bot-' + (index + 1), title: 'Custom persona', instruction: 'Play the game according to your persona.', publicStyle: 'I am ready to coordinate.', privateStyle: 'I am looking for reliable partners.', provider: '', model: '', baseUrl: '', apiKeyEnv: '', apiKey: '', temperature: '', topP: '', maxCompletionTokens: '', reasoningSplit: '', reasoningEffort: '' }; }
+function providerOptions(value) { return ['', 'scripted', 'minimax', 'opencode-go', 'openai-compatible'].map(option => '<option value="' + option + '"' + (option === value ? ' selected' : '') + '>' + (option || 'inherit global') + '</option>').join(''); }
+function reasoningSplitOptions(value) { return ['', 'true', 'false'].map(option => '<option value="' + option + '"' + (option === value ? ' selected' : '') + '>' + (option || 'inherit global') + '</option>').join(''); }
 function renderBots() {
-  botEditor.innerHTML = bots.map((bot, index) => '<div class="bot-card" data-index="' + index + '"><div class="bot-card-head"><strong>Bot ' + (index + 1) + '</strong><button class="secondary remove-bot" type="button">Remove</button></div><div class="row"><label>Name <input data-bot-field="name" value="' + escapeHtml(bot.name) + '" /></label><label>ID <input data-bot-field="id" value="' + escapeHtml(bot.id) + '" /></label></div><label>Title <input data-bot-field="title" value="' + escapeHtml(bot.title) + '" /></label><label>Instruction <textarea data-bot-field="instruction">' + escapeHtml(bot.instruction) + '</textarea></label><label>Public style <textarea data-bot-field="publicStyle">' + escapeHtml(bot.publicStyle) + '</textarea></label><label>Private style <textarea data-bot-field="privateStyle">' + escapeHtml(bot.privateStyle) + '</textarea></label></div>').join('');
+  botEditor.innerHTML = bots.map((bot, index) => '<div class="bot-card" data-index="' + index + '"><div class="bot-card-head"><strong>Bot ' + (index + 1) + '</strong><button class="secondary remove-bot" type="button">Remove</button></div><div class="row"><label>Name <input data-bot-field="name" value="' + escapeHtml(bot.name) + '" /></label><label>ID <input data-bot-field="id" value="' + escapeHtml(bot.id) + '" /></label></div><label>Title <input data-bot-field="title" value="' + escapeHtml(bot.title) + '" /></label><label>Instruction <textarea data-bot-field="instruction">' + escapeHtml(bot.instruction) + '</textarea></label><label>Public style <textarea data-bot-field="publicStyle">' + escapeHtml(bot.publicStyle) + '</textarea></label><label>Private style <textarea data-bot-field="privateStyle">' + escapeHtml(bot.privateStyle) + '</textarea></label><div class="row"><label>Provider override <select data-bot-field="provider">' + providerOptions(bot.provider || '') + '</select></label><label>Model override <input data-bot-field="model" value="' + escapeHtml(bot.model || '') + '" placeholder="inherit global" /></label></div><label>Base URL override <input data-bot-field="baseUrl" value="' + escapeHtml(bot.baseUrl || '') + '" placeholder="inherit global" /></label><label>API key for this bot <input data-bot-field="apiKey" type="password" autocomplete="off" value="' + escapeHtml(savedBotKeys[bot.id] || '') + '" placeholder="' + (savedBotKeys[bot.id] ? 'saved locally — shown as dots' : 'paste once, then click Save key') + '" /></label><button class="secondary save-bot-key" type="button">Save key</button><div class="row"><label>API key env var <input data-bot-field="apiKeyEnv" value="' + escapeHtml(bot.apiKeyEnv || '') + '" placeholder="auto if key is entered" /></label><label>Reasoning effort <input data-bot-field="reasoningEffort" value="' + escapeHtml(bot.reasoningEffort || '') + '" placeholder="provider-specific" /></label></div><div class="row"><label>Temperature <input data-bot-field="temperature" value="' + escapeHtml(bot.temperature || '') + '" placeholder="inherit" /></label><label>Top P <input data-bot-field="topP" value="' + escapeHtml(bot.topP || '') + '" placeholder="inherit" /></label></div><div class="row"><label>Max tokens <input data-bot-field="maxCompletionTokens" value="' + escapeHtml(bot.maxCompletionTokens || '') + '" placeholder="inherit" /></label><label>Reasoning split <select data-bot-field="reasoningSplit">' + reasoningSplitOptions(bot.reasoningSplit || '') + '</select></label></div></div>').join('');
+  refreshModelSuggestions();
 }
 function collectBots() {
   return [...botEditor.querySelectorAll('.bot-card')].map((card, index) => {
     const read = name => card.querySelector('[data-bot-field="' + name + '"]').value.trim();
-    return { name: read('name') || 'Harness Bot ' + (index + 1), id: read('id') || 'bot-' + (index + 1), title: read('title') || 'Custom persona', instruction: read('instruction') || 'Play the game according to your persona.', publicStyle: read('publicStyle'), privateStyle: read('privateStyle') };
+    return { name: read('name') || 'Harness Bot ' + (index + 1), id: read('id') || 'bot-' + (index + 1), title: read('title') || 'Custom persona', instruction: read('instruction') || 'Play the game according to your persona.', publicStyle: read('publicStyle'), privateStyle: read('privateStyle'), provider: read('provider'), model: read('model'), baseUrl: read('baseUrl'), apiKeyEnv: read('apiKeyEnv'), apiKey: read('apiKey'), temperature: read('temperature'), topP: read('topP'), maxCompletionTokens: read('maxCompletionTokens'), reasoningSplit: read('reasoningSplit'), reasoningEffort: read('reasoningEffort') };
   });
 }
 function runtimePayload() { return { runtimeDir: valueOf('runtimeDir'), runtimeCommand: valueOf('runtimeCommand'), gameServer: valueOf('gameServer') }; }
+function showRunError(message) {
+  serverStatus.textContent = 'error';
+  meta.innerHTML = '<strong>Run blocked before start</strong><span>' + escapeHtml(message) + '</span>';
+  terminal.innerHTML = '<span class="stderr">[error] ' + escapeHtml(message) + '</span>';
+}
+function runPayload() {
+  const payload = Object.fromEntries(new FormData(form).entries());
+  payload.appendAddressSuffix = valueOf('appendAddressSuffix');
+  payload.artifactsEnabled = valueOf('artifactsEnabled');
+  payload.bots = collectBots();
+  payload.botCount = String(payload.bots.length);
+  return payload;
+}
+function validateRunPayloadClient(payload) {
+  const globalProvider = payload.provider || 'scripted';
+  const scriptedBots = payload.bots.filter(bot => (bot.provider || globalProvider) === 'scripted').map((bot, index) => 'Bot ' + (index + 1) + ' (' + bot.name + ')');
+  if (scriptedBots.length) throw new Error('This run still has scripted bots: ' + scriptedBots.join(', ') + '. For a model game, set the top-level Provider to minimax and enter the API key there so all bots inherit it, or set provider/model/API key on every bot.');
+  const usesModelProvider = globalProvider !== 'scripted' || payload.bots.some(bot => (bot.provider || globalProvider) !== 'scripted');
+  const rounds = Number.parseInt(payload.rounds || '12', 10);
+  if (usesModelProvider && (!Number.isFinite(rounds) || rounds < 1)) throw new Error('Rounds is set to 0, so this only creates a lobby/game and makes zero model calls. Set Rounds to at least 1 for an actual model test.');
+}
 function applyRuntimeStatus(status) {
   if (status.effectiveGameServer && status.effectiveGameServer !== valueOf('gameServer')) setValue('gameServer', status.effectiveGameServer);
   const server = status.effectiveGameServer || valueOf('gameServer');
@@ -744,20 +1351,21 @@ async function stopRuntime() {
 async function submitRun() {
   startButton.disabled = true;
   serverStatus.textContent = 'starting';
-  const payload = Object.fromEntries(new FormData(form).entries());
-  payload.appendAddressSuffix = valueOf('appendAddressSuffix');
-  payload.artifactsEnabled = valueOf('artifactsEnabled');
-  payload.bots = collectBots();
-  payload.botCount = String(payload.bots.length);
+  const payload = runPayload();
   try {
+    validateRunPayloadClient(payload);
     const status = await refreshRuntimeStatus();
     if (status.serverReachable && status.effectiveGameServer) payload.gameServer = status.effectiveGameServer;
     const response = await fetch('/api/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const run = await response.json();
     if (!response.ok) throw new Error(run.error || 'Run failed to start');
     runs.unshift(run); activeRunId = run.id; attachEvents(run.id); renderRuns(); renderActive(run); serverStatus.textContent = 'running';
-  } catch (error) { serverStatus.textContent = error.message; }
-  finally { startButton.disabled = false; field('apiKey').value = ''; }
+  } catch (error) { showRunError(error.message); }
+  finally {
+    startButton.disabled = false;
+    await loadSecretStatus();
+    populateKeyFields();
+  }
 }
 async function waitForRuntimeReady(timeoutMs = 45000, intervalMs = 1000) {
   const deadline = Date.now() + timeoutMs;
@@ -769,6 +1377,7 @@ async function waitForRuntimeReady(timeoutMs = 45000, intervalMs = 1000) {
   return status;
 }
 async function startRuntimeThenRun() {
+  validateRunPayloadClient(runPayload());
   await startRuntime();
   const status = await waitForRuntimeReady();
   if (!status.serverReachable) throw new Error('Runtime started, but no reachable game server was detected yet. Check the runtime logs and retry Start run.');
@@ -777,6 +1386,20 @@ async function startRuntimeThenRun() {
 
 function renderRuns() {
   runList.innerHTML = runs.map(run => '<div class="run-card ' + (run.id === activeRunId ? 'active' : '') + '" data-id="' + run.id + '"><span class="pill ' + run.status + '">' + run.status + '</span><div style="margin-top:8px">' + run.id + '</div><div class="note">' + run.config.provider + ' · ' + run.config.model + '</div></div>').join('');
+}
+function logKey(entry) {
+  return [entry.timestamp || '', entry.stream || '', entry.text || ''].join('\u0000');
+}
+function mergeRunLogs(existing, incoming) {
+  const merged = [];
+  const seen = new Set();
+  for (const entry of [...(existing || []), ...(incoming || [])]) {
+    const key = logKey(entry);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged;
 }
 function renderActive(run) {
   if (!run) { meta.textContent = 'No run selected.'; terminal.textContent = ''; return; }
@@ -797,7 +1420,12 @@ function attachEvents(runId) {
   source.addEventListener('status', event => {
     const run = JSON.parse(event.data);
     const idx = runs.findIndex(item => item.id === run.id);
-    if (idx >= 0) runs[idx] = run; else runs.unshift(run);
+    if (idx >= 0) {
+      run.logs = mergeRunLogs(runs[idx].logs, run.logs);
+      runs[idx] = run;
+    } else {
+      runs.unshift(run);
+    }
     renderRuns(); renderActive(run);
   });
   source.addEventListener('log', event => {
@@ -805,7 +1433,7 @@ function attachEvents(runId) {
     const run = runs.find(item => item.id === runId);
     if (!run) return;
     run.logs = run.logs || [];
-    run.logs.push(entry);
+    if (!run.logs.some(existing => logKey(existing) === logKey(entry))) run.logs.push(entry);
     renderActive(run);
   });
 }
@@ -823,25 +1451,72 @@ botEditor.addEventListener('click', event => {
   const index = Number(card.dataset.index);
   bots = collectBots().filter((_, botIndex) => botIndex !== index);
   renderBots();
+  scheduleConfigSave();
 });
 document.querySelector('#add-bot').addEventListener('click', () => {
   bots = collectBots();
   bots.push(blankBot(bots.length));
   renderBots();
+  scheduleConfigSave();
 });
 document.querySelector('#reset-bots').addEventListener('click', () => {
   bots = defaultBots.map(bot => ({ ...bot }));
   renderBots();
+  scheduleConfigSave();
 });
+field('provider').addEventListener('change', () => { applyProviderDefaults(); refreshModelSuggestions(); populateKeyFields(); });
+botEditor.addEventListener('change', event => {
+  if (event.target.matches('[data-bot-field="provider"]')) refreshModelSuggestions();
+});
+document.querySelector('#save-api-key').addEventListener('click', () => { saveApiKey().catch(error => { apiKeyNote.textContent = error.message; }); });
+document.querySelector('#clear-api-key').addEventListener('click', () => { clearApiKey().catch(error => { apiKeyNote.textContent = error.message; }); });
 document.querySelector('#runtime-status').addEventListener('click', () => { void refreshRuntimeStatus(); });
 document.querySelector('#runtime-start').addEventListener('click', () => { startRuntime().catch(error => { runtimeNote.textContent = error.message; }); });
 document.querySelector('#runtime-start-run').addEventListener('click', () => { startRuntimeThenRun().catch(error => { runtimeNote.textContent = error.message; serverStatus.textContent = error.message; }); });
 document.querySelector('#runtime-stop').addEventListener('click', () => { stopRuntime().catch(error => { runtimeNote.textContent = error.message; }); });
+document.querySelector('#saved-key-picker').addEventListener('change', event => {
+  const v = event.target.value;
+  if (!v) return;
+  const idx = v.indexOf(':');
+  const kind = v.slice(0, idx);
+  const id = v.slice(idx + 1);
+  const key = kind === 'provider' ? savedKeys[id] : savedBotKeys[id];
+  if (key) { setValue('apiKey', key); apiKeyNote.textContent = 'Loaded saved key ' + maskKey(key) + ' into the API key field.'; }
+});
+botEditor.addEventListener('click', async event => {
+  const btn = event.target.closest('.save-bot-key');
+  if (!btn) return;
+  const card = event.target.closest('.bot-card');
+  const botId = card.querySelector('[data-bot-field="id"]').value.trim();
+  const apiKey = card.querySelector('[data-bot-field="apiKey"]').value.trim();
+  const botProvider = (card.querySelector('[data-bot-field="provider"]').value || valueOf('provider')).trim();
+  const botModel = (card.querySelector('[data-bot-field="model"]').value || defaultModelForProvider(botProvider)).trim();
+  if (!botId) { apiKeyNote.textContent = 'Give the bot an ID before saving its key.'; return; }
+  if (!apiKey) { apiKeyNote.textContent = 'Paste a key in this bot before saving.'; return; }
+  try {
+    const response = await fetch('/api/secrets/bot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botId, apiKey, provider: botProvider, model: botModel }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Failed to save bot key');
+    savedKeys = data.savedKeys || savedKeys;
+    savedBotKeys = data.savedBotKeys || savedBotKeys;
+    savedBotMeta = data.savedBotMeta || savedBotMeta;
+    localBotSecrets = data.localBotSecrets || localBotSecrets;
+    rebuildKeyPicker();
+    apiKeyNote.textContent = 'Saved key for bot ' + botId + (botProvider ? ' (' + botProvider + (botModel ? ' / ' + botModel : '') + ')' : '') + ' · ' + maskKey(apiKey) + '. Persists across refreshes.';
+  } catch (error) { apiKeyNote.textContent = error.message; }
+});
 form.addEventListener('submit', async event => {
   event.preventDefault();
   await submitRun();
 });
+form.addEventListener('input', () => { scheduleConfigSave(); });
+form.addEventListener('change', () => { scheduleConfigSave(); });
 fetch('/api/defaults').then(res => res.json()).then(data => {
+  localSecrets = data.localSecrets || {};
+  localBotSecrets = data.localBotSecrets || [];
+  savedKeys = data.savedKeys || {};
+  savedBotKeys = data.savedBotKeys || {};
+  savedBotMeta = data.savedBotMeta || {};
   for (const [key, value] of Object.entries(data.defaults)) setValue(key, value);
   for (const [key, value] of Object.entries(data.runtime)) setValue(key, value);
   const select = field('botConfig');
@@ -850,6 +1525,8 @@ fetch('/api/defaults').then(res => res.json()).then(data => {
   defaultBots = data.bots && data.bots.length ? data.bots : [blankBot(0), blankBot(1), blankBot(2), blankBot(3)];
   bots = defaultBots.map(bot => ({ ...bot }));
   renderBots();
+  refreshApiKeyNote();
+  populateSavedKeys();
   void refreshRuntimeStatus();
   return loadRuns();
 });
